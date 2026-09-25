@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <errno.h>
 #include <ESP32Servo.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -7,7 +8,7 @@
 #include "dashboard_assets.h"
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-#include "secrets.h"  // Copy secrets.example.h to secrets.h before building.
+#include "secrets.h"
 
 const char* MDNS_HOST = "mcu-eye-monster";
 // const char* MDNS_HOST = "mcu-plant-1";
@@ -68,13 +69,19 @@ static bool isPaused = false;
 static int seq_open_deg = 30;
 static int seq_close_deg = 85;
 static int seq_hold_ms = 200;
+static int seq_cycles_per_session = 5;
+static int seq_rest_ms = 10000;
 
 static int commanded_angles[NUM_SERVOS] = { START_DEG, START_DEG, START_DEG, START_DEG, START_DEG };
 static char servo_status_str[NUM_SERVOS][16] = { "IDLE", "IDLE", "PARKED", "PARKED", "PARKED" };
 static char servo_phase_str[NUM_SERVOS][16] = { "idle", "idle", "idle", "idle", "idle" };
 static bool servo_running[NUM_SERVOS] = { false, false, false, false, false };
 static bool explicit_stopped[NUM_SERVOS] = { false, false, false, false, false };
+static int servo_cycle[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+static uint32_t servo_rest_until[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
 static uint32_t servoEpoch[NUM_SERVOS] = { 1, 1, 1, 1, 1 };
+static bool servo_attached[NUM_SERVOS] = { true, true, true, true, true };
+static int last_actual_pulse_us[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
 static bool relay_states[2] = { false, false };
 
 // Thread-safe state helpers
@@ -89,7 +96,7 @@ uint32_t bumpServoEpoch(int servoIndex) {
 bool isEpochValid(int servoIndex, uint32_t token) {
   if (!stateMutex || servoIndex < 0 || servoIndex >= NUM_SERVOS) return false;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  bool valid = (!isPaused && servoEpoch[servoIndex] == token);
+  bool valid = (!isPaused && servoEpoch[servoIndex] == token && servo_attached[servoIndex]);
   xSemaphoreGive(stateMutex);
   return valid;
 }
@@ -113,11 +120,13 @@ bool getIsPaused() {
 void startServoSeq(int index) {
   if (index < 0 || index >= 2) return;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (!isPaused) {
+  if (!isPaused && servo_attached[index]) {
     explicit_stopped[index] = false;
     if (!servo_running[index]) {
       servo_running[index] = true;
       servoEpoch[index]++;
+      servo_cycle[index] = 1;
+      servo_rest_until[index] = 0;
       strncpy(servo_phase_str[index], "open", sizeof(servo_phase_str[index]) - 1);
       servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
       strncpy(servo_status_str[index], "OPEN", sizeof(servo_status_str[index]) - 1);
@@ -136,13 +145,20 @@ void stopServoSeq(int index, bool explicitStop) {
   if (explicitStop) {
     explicit_stopped[index] = true;
   }
-  if (servo_running[index]) {
-    servo_running[index] = false;
+  if (servo_running[index] || explicitStop) {
     servoEpoch[index]++;
   }
+  servo_running[index] = false;
+  servo_cycle[index] = 0;
+  servo_rest_until[index] = 0;
   strncpy(servo_phase_str[index], "idle", sizeof(servo_phase_str[index]) - 1);
   servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
-  strncpy(servo_status_str[index], "IDLE", sizeof(servo_status_str[index]) - 1);
+  // ponytail: preserve DETACHED status on stop
+  if (!servo_attached[index]) {
+    strncpy(servo_status_str[index], "DETACHED", sizeof(servo_status_str[index]) - 1);
+  } else {
+    strncpy(servo_status_str[index], "IDLE", sizeof(servo_status_str[index]) - 1);
+  }
   servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
   QueueHandle_t q = (index == 0) ? servoQueue1 : servoQueue2;
   if (q) xQueueReset(q);
@@ -152,8 +168,10 @@ void stopServoSeq(int index, bool explicitStop) {
 void restartServoSeq(int index) {
   if (index < 0 || index >= 2) return;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (!isPaused && servo_running[index]) {
+  if (!isPaused && servo_running[index] && servo_attached[index]) {
     servoEpoch[index]++;
+    servo_cycle[index] = 1;
+    servo_rest_until[index] = 0;
     strncpy(servo_phase_str[index], "open", sizeof(servo_phase_str[index]) - 1);
     servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
     strncpy(servo_status_str[index], "OPEN", sizeof(servo_status_str[index]) - 1);
@@ -168,10 +186,12 @@ bool triggerSensorStart(int index) {
   if (index < 0 || index >= 2) return false;
   bool started = false;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (!isPaused && !explicit_stopped[index]) {
+  if (!isPaused && !explicit_stopped[index] && servo_attached[index]) {
     if (!servo_running[index]) {
       servo_running[index] = true;
       servoEpoch[index]++;
+      servo_cycle[index] = 1;
+      servo_rest_until[index] = 0;
       strncpy(servo_phase_str[index], "open", sizeof(servo_phase_str[index]) - 1);
       servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
       strncpy(servo_status_str[index], "OPEN", sizeof(servo_status_str[index]) - 1);
@@ -244,24 +264,44 @@ void moveServo(int setpoint_deg, Servo& servo, int servoIndex, uint32_t token) {
   int setpoint_us =
     map(setpoint_deg, MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
 
-  float move = servo.readMicroseconds();
+  float move = 0.0f;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (isPaused || servoEpoch[servoIndex] != token || !servo_attached[servoIndex]) {
+    xSemaphoreGive(stateMutex);
+    return;
+  }
+  // ponytail: replace initial hardware read with tracked pulse, avoid reading detached hw
+  move = (float)last_actual_pulse_us[servoIndex];
   if (move < MIN_SERVO_US || move > MAX_SERVO_US) {
     move = MIN_SERVO_US;
   }
+  xSemaphoreGive(stateMutex);
+
   float prevmove = move;
   const float alpha = 0.01;
 
   while (abs(setpoint_us - (int)move) > 1) {
-    if (!isEpochValid(servoIndex, token)) break;  // ponytail: token mismatch halts obsolete move promptly
     move = (setpoint_us * alpha) + (prevmove * (1.0 - alpha));
     prevmove = move;
 
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    if (isPaused || servoEpoch[servoIndex] != token || !servo_attached[servoIndex]) {
+      xSemaphoreGive(stateMutex);
+      return;
+    }
     servo.writeMicroseconds((int)move);
+    last_actual_pulse_us[servoIndex] = (int)move;
+    xSemaphoreGive(stateMutex);
+
     vTaskDelay(pdMS_TO_TICKS(5));
   }
-  if (isEpochValid(servoIndex, token)) {
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (!isPaused && servoEpoch[servoIndex] == token && servo_attached[servoIndex]) {
     servo.writeMicroseconds(setpoint_us);
+    last_actual_pulse_us[servoIndex] = setpoint_us;
   }
+  xSemaphoreGive(stateMutex);
 }
 
 bool waitEpochDelay(int servoIndex, uint32_t token, int delayMs) {
@@ -299,6 +339,9 @@ void servoWorkerTask(void* pvParameters) {
   QueueHandle_t q = (idx == 0) ? servoQueue1 : servoQueue2;
   Servo& s = servos[idx];
 
+  int currentCycle = 1;
+  uint32_t currentToken = 0;
+
   for (;;) {
     // 1. Process manual angle command atomically under stateMutex
     ServoCommand cmd;
@@ -306,11 +349,13 @@ void servoWorkerTask(void* pvParameters) {
     uint32_t token = 0;
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    if (!isPaused && !servo_running[idx] && q != NULL) {
+    if (!isPaused && !servo_running[idx] && servo_attached[idx] && q != NULL) {
       if (xQueueReceive(q, &cmd, 0) == pdTRUE) {
         if (cmd.epoch == servoEpoch[idx]) {
           token = servoEpoch[idx];  // Only cancellation invalidates other admitted commands.
           commanded_angles[idx] = cmd.angle;
+          servo_cycle[idx] = 0;
+          servo_rest_until[idx] = 0;
           strncpy(servo_status_str[idx], "MANUAL SET", sizeof(servo_status_str[idx]) - 1);
           servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
           strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
@@ -318,6 +363,8 @@ void servoWorkerTask(void* pvParameters) {
           hasCmd = true;
         }
       }
+    } else if (!servo_attached[idx] && q != NULL) {
+      while (xQueueReceive(q, &cmd, 0) == pdTRUE);
     }
     xSemaphoreGive(stateMutex);
 
@@ -325,30 +372,49 @@ void servoWorkerTask(void* pvParameters) {
       moveServo(cmd.angle, s, idx, token);
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       if (servoEpoch[idx] == token && !isPaused && !servo_running[idx]) {
-        strncpy(servo_status_str[idx], "IDLE", sizeof(servo_status_str[idx]) - 1);
-        servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+        if (servo_attached[idx]) {
+          strncpy(servo_status_str[idx], "IDLE", sizeof(servo_status_str[idx]) - 1);
+          servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+        } else {
+          strncpy(servo_status_str[idx], "DETACHED", sizeof(servo_status_str[idx]) - 1);
+          servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+        }
       }
       xSemaphoreGive(stateMutex);
     }
 
-    // 2. Continuous MCU loop: open -> hold -> close -> hold repeats
+    // 2. Session execution: N cycles of (open -> hold -> close -> hold) then rest closed
     bool run = false;
     int openDeg = 30, closeDeg = 85, holdMs = 200;
+    int cyclesPerSession = 5, restMs = 10000;
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    if (!isPaused && servo_running[idx]) {
+    if (!isPaused && servo_running[idx] && servo_attached[idx]) {
       run = true;
       token = servoEpoch[idx];
       openDeg = seq_open_deg;
       closeDeg = seq_close_deg;
       holdMs = seq_hold_ms;
+      cyclesPerSession = seq_cycles_per_session;
+      restMs = seq_rest_ms;
+      if (currentToken != token) {
+        currentToken = token;
+        currentCycle = 1;
+        servo_cycle[idx] = 1;
+        servo_rest_until[idx] = 0;
+      }
+    } else {
+      currentToken = 0;
+      currentCycle = 1;
     }
     xSemaphoreGive(stateMutex);
 
     if (run) {
       // Step A: Target Open & hold
       xSemaphoreTake(stateMutex, portMAX_DELAY);
-      if (servoEpoch[idx] == token && !isPaused && servo_running[idx]) {
+      if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+        servo_cycle[idx] = currentCycle;
+        servo_rest_until[idx] = 0;
         commanded_angles[idx] = openDeg;
         strncpy(servo_phase_str[idx], "open", sizeof(servo_phase_str[idx]) - 1);
         servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
@@ -365,7 +431,9 @@ void servoWorkerTask(void* pvParameters) {
 
       // Step B: Target Close & hold
       xSemaphoreTake(stateMutex, portMAX_DELAY);
-      if (servoEpoch[idx] == token && !isPaused && servo_running[idx]) {
+      if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+        servo_cycle[idx] = currentCycle;
+        servo_rest_until[idx] = 0;
         commanded_angles[idx] = closeDeg;
         strncpy(servo_phase_str[idx], "close", sizeof(servo_phase_str[idx]) - 1);
         servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
@@ -378,6 +446,45 @@ void servoWorkerTask(void* pvParameters) {
       if (!waitEpochDelay(idx, token, holdMs)) {
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
+      }
+
+      // Check session cycle completion
+      if (currentCycle >= cyclesPerSession) {
+        // Rest phase (default position closed)
+        if (restMs > 0) {
+          xSemaphoreTake(stateMutex, portMAX_DELAY);
+          if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+            servo_cycle[idx] = currentCycle;
+            servo_rest_until[idx] = millis() + (uint32_t)restMs;
+            commanded_angles[idx] = closeDeg;
+            strncpy(servo_phase_str[idx], "rest", sizeof(servo_phase_str[idx]) - 1);
+            servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+            strncpy(servo_status_str[idx], "REST", sizeof(servo_status_str[idx]) - 1);
+            servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+          }
+          xSemaphoreGive(stateMutex);
+
+          if (!waitEpochDelay(idx, token, restMs)) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+          }
+        }
+
+        // Rest completed; restart next session from cycle 1
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+          servo_rest_until[idx] = 0;
+          currentCycle = 1;
+          servo_cycle[idx] = 1;
+        }
+        xSemaphoreGive(stateMutex);
+      } else {
+        currentCycle++;
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+          servo_cycle[idx] = currentCycle;
+        }
+        xSemaphoreGive(stateMutex);
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -430,19 +537,33 @@ void handleApiStatus() {
   char statuses[NUM_SERVOS][16];
   char phases[NUM_SERVOS][16];
   bool running[NUM_SERVOS];
+  int cycles[NUM_SERVOS];
+  uint32_t restRemaining[NUM_SERVOS];
+  bool attached[NUM_SERVOS];
+  uint32_t now = millis();
+
   for (int i = 0; i < NUM_SERVOS; i++) {
     angles[i] = commanded_angles[i];
     strncpy(statuses[i], servo_status_str[i], sizeof(statuses[i]) - 1);
     statuses[i][sizeof(statuses[i]) - 1] = '\0';
     strncpy(phases[i], servo_phase_str[i], sizeof(phases[i]) - 1);
     phases[i][sizeof(phases[i]) - 1] = '\0';
-    running[i] = servo_running[i];
+    attached[i] = servo_attached[i];
+    running[i] = servo_running[i] && servo_attached[i];
+    cycles[i] = servo_attached[i] ? servo_cycle[i] : 0;
+    if (running[i] && strcmp(phases[i], "rest") == 0 && servo_rest_until[i] > now) {
+      restRemaining[i] = servo_rest_until[i] - now;
+    } else {
+      restRemaining[i] = 0;
+    }
   }
   bool r1 = relay_states[0];
   bool r2 = relay_states[1];
   int sOpen = seq_open_deg;
   int sClose = seq_close_deg;
   int sHold = seq_hold_ms;
+  int sCycles = seq_cycles_per_session;
+  int sRest = seq_rest_ms;
   xSemaphoreGive(stateMutex);
 
   uint32_t uptimeSec = millis() / 1000;
@@ -451,7 +572,7 @@ void handleApiStatus() {
   String staIp = wifiConn ? WiFi.localIP().toString() : "disconnected";
   String apIp = WiFi.softAPIP().toString();
 
-  char json[1280];
+  char json[2560];
   snprintf(json, sizeof(json),
            "{"
            "\"mode\":\"%s\","
@@ -465,17 +586,17 @@ void handleApiStatus() {
            "\"mdns\":\"%s\","
            "\"ota_auth\":\"none (preexisting limitation)\","
            "\"servos\":["
-           "{\"id\":1,\"pin\":%d,\"name\":\"Servo 1\",\"angle\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\"},"
-           "{\"id\":2,\"pin\":%d,\"name\":\"Servo 2\",\"angle\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\"},"
-           "{\"id\":3,\"pin\":%d,\"name\":\"Servo 3\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\"},"
-           "{\"id\":4,\"pin\":%d,\"name\":\"Servo 4\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\"},"
-           "{\"id\":5,\"pin\":%d,\"name\":\"Servo 5\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\"}"
+           "{\"id\":1,\"pin\":%d,\"name\":\"Servo 1\",\"angle\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
+           "{\"id\":2,\"pin\":%d,\"name\":\"Servo 2\",\"angle\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
+           "{\"id\":3,\"pin\":%d,\"name\":\"Servo 3\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
+           "{\"id\":4,\"pin\":%d,\"name\":\"Servo 4\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
+           "{\"id\":5,\"pin\":%d,\"name\":\"Servo 5\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s}"
            "],"
            "\"relays\":["
            "{\"id\":1,\"pin\":%d,\"state\":%d},"
            "{\"id\":2,\"pin\":%d,\"state\":%d}"
            "],"
-           "\"sequence\":{\"open_deg\":%d,\"close_deg\":%d,\"hold_ms\":%d}"
+           "\"sequence\":{\"open_deg\":%d,\"close_deg\":%d,\"hold_ms\":%d,\"cycles_per_session\":%d,\"rest_ms\":%d}"
            "}",
            curAuto ? "auto" : "manual",
            curPause ? "true" : "false",
@@ -486,14 +607,14 @@ void handleApiStatus() {
            staIp.c_str(),
            apIp.c_str(),
            MDNS_HOST,
-           SERVO_PINS[0], angles[0], statuses[0], running[0] ? "true" : "false", phases[0],
-           SERVO_PINS[1], angles[1], statuses[1], running[1] ? "true" : "false", phases[1],
-           SERVO_PINS[2], angles[2], statuses[2],
-           SERVO_PINS[3], angles[3], statuses[3],
-           SERVO_PINS[4], angles[4], statuses[4],
+           SERVO_PINS[0], angles[0], statuses[0], running[0] ? "true" : "false", phases[0], cycles[0], restRemaining[0], attached[0] ? "true" : "false",
+           SERVO_PINS[1], angles[1], statuses[1], running[1] ? "true" : "false", phases[1], cycles[1], restRemaining[1], attached[1] ? "true" : "false",
+           SERVO_PINS[2], angles[2], statuses[2], attached[2] ? "true" : "false",
+           SERVO_PINS[3], angles[3], statuses[3], attached[3] ? "true" : "false",
+           SERVO_PINS[4], angles[4], statuses[4], attached[4] ? "true" : "false",
            RELAY_1, r1 ? 1 : 0,
            RELAY_2, r2 ? 1 : 0,
-           sOpen, sClose, sHold);
+           sOpen, sClose, sHold, sCycles, sRest);
 
   server.send(200, "application/json", json);
 }
@@ -509,8 +630,8 @@ void handleApiMode() {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     isAutoMode = false;
     xSemaphoreGive(stateMutex);
-    stopServoSeq(0, false);
-    stopServoSeq(1, false);
+    stopServoSeq(0, true);
+    stopServoSeq(1, true);
     server.send(200, "application/json", "{\"ok\":true,\"mode\":\"manual\"}");
   } else if (m == "auto") {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -543,14 +664,23 @@ void handleApiPause() {
     }
     servo_running[0] = false;
     servo_running[1] = false;
+    servo_cycle[0] = 0;
+    servo_cycle[1] = 0;
+    servo_rest_until[0] = 0;
+    servo_rest_until[1] = 0;
     strncpy(servo_phase_str[0], "idle", sizeof(servo_phase_str[0]) - 1);
     servo_phase_str[0][sizeof(servo_phase_str[0]) - 1] = '\0';
     strncpy(servo_phase_str[1], "idle", sizeof(servo_phase_str[1]) - 1);
     servo_phase_str[1][sizeof(servo_phase_str[1]) - 1] = '\0';
-    strncpy(servo_status_str[0], "IDLE", sizeof(servo_status_str[0]) - 1);
-    servo_status_str[0][sizeof(servo_status_str[0]) - 1] = '\0';
-    strncpy(servo_status_str[1], "IDLE", sizeof(servo_status_str[1]) - 1);
-    servo_status_str[1][sizeof(servo_status_str[1]) - 1] = '\0';
+    // ponytail: preserve DETACHED status when pausing
+    for (int i = 0; i < 2; i++) {
+      if (!servo_attached[i]) {
+        strncpy(servo_status_str[i], "DETACHED", sizeof(servo_status_str[i]) - 1);
+      } else {
+        strncpy(servo_status_str[i], "IDLE", sizeof(servo_status_str[i]) - 1);
+      }
+      servo_status_str[i][sizeof(servo_status_str[i]) - 1] = '\0';
+    }
     if (servoQueue1) xQueueReset(servoQueue1);
     if (servoQueue2) xQueueReset(servoQueue2);
     xSemaphoreGive(stateMutex);
@@ -596,6 +726,11 @@ void handleApiServo() {
     server.send(409, "application/json", "{\"error\":\"Manual commands locked in Automatic mode\"}");
     return;
   }
+  if (!servo_attached[id - 1]) {
+    xSemaphoreGive(stateMutex);
+    server.send(409, "application/json", "{\"error\":\"Servo is detached\"}");
+    return;
+  }
   if (servo_running[id - 1]) {
     xSemaphoreGive(stateMutex);
     server.send(409, "application/json", "{\"error\":\"Manual commands locked while sequence is running\"}");
@@ -603,9 +738,13 @@ void handleApiServo() {
   }
 
   int idx = id - 1;
-  ServoCommand cmd = { CMD_SET_ANGLE, angle, servoEpoch[idx] };
+  uint32_t candidateEpoch = servoEpoch[idx] + 1;
+  ServoCommand cmd = { CMD_SET_ANGLE, angle, candidateEpoch };
   QueueHandle_t q = (idx == 0) ? servoQueue1 : servoQueue2;
   if (q && xQueueSend(q, &cmd, 0) == pdTRUE) {
+    servoEpoch[idx] = candidateEpoch;
+    servo_cycle[idx] = 0;
+    servo_rest_until[idx] = 0;
     queued = true;
   }
   xSemaphoreGive(stateMutex);
@@ -646,6 +785,13 @@ void handleApiRun() {
       server.send(409, "application/json", "{\"error\":\"Firmware is paused\"}");
       return;
     }
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    bool isAtt = servo_attached[id - 1];
+    xSemaphoreGive(stateMutex);
+    if (!isAtt) {
+      server.send(409, "application/json", "{\"error\":\"Servo is detached\"}");
+      return;
+    }
     startServoSeq(id - 1);
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%d,\"running\":true}", id);
     server.send(200, "application/json", resp);
@@ -653,6 +799,107 @@ void handleApiRun() {
     stopServoSeq(id - 1, true /* explicit stop */);
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%d,\"running\":false}", id);
     server.send(200, "application/json", resp);
+  }
+}
+
+// POST /api/attachment id=1|2&attached=0|1 explicit attach/detach
+void handleApiAttachment() {
+  if (!checkMutationAuth()) return;
+  if (!server.hasArg("id") || !server.hasArg("attached")) {
+    server.send(400, "application/json", "{\"error\":\"Missing id or attached parameter\"}");
+    return;
+  }
+  String idStr = server.arg("id");
+  if (idStr != "1" && idStr != "2") {
+    server.send(400, "application/json", "{\"error\":\"Parameter id must be 1 or 2\"}");
+    return;
+  }
+  int id = (idStr == "1") ? 1 : 2;
+
+  String aStr = server.arg("attached");
+  int attVal = -1;
+  if (aStr == "1" || aStr.equalsIgnoreCase("true")) attVal = 1;
+  else if (aStr == "0" || aStr.equalsIgnoreCase("false")) attVal = 0;
+
+  if (attVal == -1) {
+    server.send(400, "application/json", "{\"error\":\"Parameter attached must be 1 or 0\"}");
+    return;
+  }
+
+  int idx = id - 1;
+  char resp[64];
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+  if (attVal == 0) {
+    // Detach: cancels queued commands/running/session/rest, invalidates epoch, disables PWM
+    // Always permitted even during pause/auto/running. Idempotent.
+    if (servo_attached[idx]) {
+      servoEpoch[idx]++;
+      servo_running[idx] = false;
+      servo_cycle[idx] = 0;
+      servo_rest_until[idx] = 0;
+      servo_attached[idx] = false;
+      strncpy(servo_status_str[idx], "DETACHED", sizeof(servo_status_str[idx]) - 1);
+      servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+      strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
+      servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+      QueueHandle_t q = (idx == 0) ? servoQueue1 : servoQueue2;
+      if (q) xQueueReset(q);
+      servos[idx].detach();
+    }
+    xSemaphoreGive(stateMutex);
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%d,\"attached\":false}", id);
+    server.send(200, "application/json", resp);
+    return;
+  } else {
+    // Attach: reject attach while paused (detach always permitted).
+    if (isPaused) {
+      xSemaphoreGive(stateMutex);
+      server.send(409, "application/json", "{\"error\":\"Cannot attach servo while paused\"}");
+      return;
+    }
+    // Idempotent: no duplicate reinitialization
+    if (servo_attached[idx]) {
+      xSemaphoreGive(stateMutex);
+      snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%d,\"attached\":true}", id);
+      server.send(200, "application/json", resp);
+      return;
+    }
+
+    // Attach explicit restores last ACTUAL emitted pulse not target commanded angle,
+    // reuse 50Hz pin and 500..2500, check servo.attached() for success;
+    // leaves idle stopped and sensor explicitStopped=true
+    servos[idx].setPeriodHertz(50);
+    servos[idx].attach(SERVO_PINS[idx], MIN_SERVO_US, MAX_SERVO_US);
+    if (!servos[idx].attached()) {
+      xSemaphoreGive(stateMutex);
+      server.send(500, "application/json", "{\"error\":\"Failed to attach servo PWM\"}");
+      return;
+    }
+
+    int restorePulse = last_actual_pulse_us[idx];
+    if (restorePulse < MIN_SERVO_US || restorePulse > MAX_SERVO_US) {
+      restorePulse = map(START_DEG, MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
+      last_actual_pulse_us[idx] = restorePulse;
+    }
+    servos[idx].writeMicroseconds(restorePulse);
+
+    servo_attached[idx] = true;
+    servo_running[idx] = false;
+    servo_cycle[idx] = 0;
+    servo_rest_until[idx] = 0;
+    explicit_stopped[idx] = true;
+    commanded_angles[idx] = map(restorePulse, MIN_SERVO_US, MAX_SERVO_US, MIN_SERVO, MAX_SERVO);
+    strncpy(servo_status_str[idx], "IDLE", sizeof(servo_status_str[idx]) - 1);
+    servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+    strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
+    servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+
+    xSemaphoreGive(stateMutex);
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%d,\"attached\":true}", id);
+    server.send(200, "application/json", resp);
+    return;
   }
 }
 
@@ -687,6 +934,19 @@ void handleApiRelay() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+static bool parseStrictInt(const String& s, long minVal, long maxVal, int& outVal) {
+  if (s.length() == 0) return false;
+  const char* str = s.c_str();
+  if (*str != '+' && *str != '-' && !isdigit((unsigned char)*str)) return false;
+  char* endptr = NULL;
+  errno = 0;
+  long val = strtol(str, &endptr, 10);
+  if (errno != 0 || endptr == str || *endptr != '\0') return false;
+  if (val < minVal || val > maxVal) return false;
+  outVal = (int)val;
+  return true;
+}
+
 void handleApiSequence() {
   if (!checkMutationAuth()) return;
   if (!server.hasArg("open_deg") || !server.hasArg("close_deg") || !server.hasArg("hold_ms")) {
@@ -710,10 +970,28 @@ void handleApiSequence() {
     return;
   }
 
+  int cycles = seq_cycles_per_session;
+  if (server.hasArg("cycles_per_session")) {
+    if (!parseStrictInt(server.arg("cycles_per_session"), 1, 100, cycles)) {
+      server.send(400, "application/json", "{\"error\":\"Cycles per session must be an integer between 1 and 100\"}");
+      return;
+    }
+  }
+
+  int rest = seq_rest_ms;
+  if (server.hasArg("rest_ms")) {
+    if (!parseStrictInt(server.arg("rest_ms"), 0, 3600000, rest)) {
+      server.send(400, "application/json", "{\"error\":\"Rest duration must be an integer between 0 and 3600000 ms\"}");
+      return;
+    }
+  }
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   seq_open_deg = open;
   seq_close_deg = close;
   seq_hold_ms = hold;
+  seq_cycles_per_session = cycles;
+  seq_rest_ms = rest;
   xSemaphoreGive(stateMutex);
 
   // Restart active loops with new parameters immediately
@@ -729,6 +1007,8 @@ void handleApiSequenceReset() {
   seq_open_deg = 30;
   seq_close_deg = 85;
   seq_hold_ms = 200;
+  seq_cycles_per_session = 5;
+  seq_rest_ms = 10000;
   xSemaphoreGive(stateMutex);
 
   restartServoSeq(0);
@@ -769,6 +1049,7 @@ void initWebServer() {
   server.on("/api/pause", HTTP_POST, handleApiPause);
   server.on("/api/servo", HTTP_POST, handleApiServo);
   server.on("/api/run", HTTP_POST, handleApiRun);
+  server.on("/api/attachment", HTTP_POST, handleApiAttachment);
   server.on("/api/relay", HTTP_POST, handleApiRelay);
   server.on("/api/sequence", HTTP_POST, handleApiSequence);
   server.on("/api/sequence/reset", HTTP_POST, handleApiSequenceReset);
@@ -806,6 +1087,7 @@ void initOTA() {
 // ─── SETUP & MAIN LOOP ───────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  delay(3000);
 
   // Synchronization primitives
   stateMutex = xSemaphoreCreateMutex();
@@ -825,6 +1107,8 @@ void setup() {
     servos[i].setPeriodHertz(50);
     servos[i].attach(SERVO_PINS[i], MIN_SERVO_US, MAX_SERVO_US);
     servos[i].write(START_DEG);
+    last_actual_pulse_us[i] = map(START_DEG, MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
+    servo_attached[i] = servos[i].attached();
   }
 
   pinMode(RELAY_1, OUTPUT);
@@ -836,7 +1120,7 @@ void setup() {
   digitalWrite(RELAY_1, LOW);
   digitalWrite(RELAY_2, LOW);
 
-  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 4096, NULL, 1, NULL, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 8192, NULL, 1, NULL, 0) != pdPASS) {
     Serial.println("[WiFi] ERROR: Could not create WiFi task; STA unavailable. AP remains enabled.");
   }
 
@@ -856,6 +1140,11 @@ void setup() {
 }
 
 void loop() {
+  static long long pingStart = millis();
+  if (millis() - pingStart > 60000) {
+    Serial.println("PING!");
+  }
+
   server.handleClient();
   ElegantOTA.loop();
   vTaskDelay(pdMS_TO_TICKS(10));

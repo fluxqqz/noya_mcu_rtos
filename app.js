@@ -9,23 +9,28 @@ const DEFAULT_CONFIG = Object.freeze({
   openAngle: 30,
   closeAngle: 85,
   holdMs: 200,
+  cyclesPerSession: 5,
+  restMs: 10000,
 });
 
 const DEFAULT_PRESETS = Object.freeze([30, 85]);
 
 /**
  * Validates sequence parameters.
- * Requirements: integer angles (0-180), distinct angles, hold 50-5000ms.
- * Repeat interval setting has been removed per firmware contract.
+ * Requirements:
+ * - openAngle, closeAngle: integer 0-180, distinct
+ * - holdMs: integer 50-5000ms
+ * - cyclesPerSession: integer 1-100, default 5
+ * - restMs: integer 0-3600000ms, default 10000 (accepts restMs or restSec with explicit conversion)
  */
 function validateSettings(cfg) {
   if (!cfg || typeof cfg !== 'object') {
     return { valid: false, error: 'Invalid configuration object' };
   }
 
-  const openAngle = Number(cfg.openAngle);
-  const closeAngle = Number(cfg.closeAngle);
-  const holdMs = Number(cfg.holdMs);
+  const openAngle = Number(cfg.openAngle !== undefined ? cfg.openAngle : cfg.open_deg);
+  const closeAngle = Number(cfg.closeAngle !== undefined ? cfg.closeAngle : cfg.close_deg);
+  const holdMs = Number(cfg.holdMs !== undefined ? cfg.holdMs : cfg.hold_ms);
 
   if (!Number.isInteger(openAngle) || openAngle < 0 || openAngle > 180) {
     return { valid: false, error: 'Open angle must be an integer between 0° and 180°' };
@@ -40,10 +45,39 @@ function validateSettings(cfg) {
     return { valid: false, error: 'Hold delay must be an integer between 50 ms and 5000 ms' };
   }
 
+  let rawCycles = cfg.cyclesPerSession !== undefined ? cfg.cyclesPerSession : cfg.cycles_per_session;
+  if (rawCycles === undefined || rawCycles === null || rawCycles === '') {
+    rawCycles = DEFAULT_CONFIG.cyclesPerSession;
+  }
+  const cyclesPerSession = Number(rawCycles);
+  if (!Number.isInteger(cyclesPerSession) || cyclesPerSession < 1 || cyclesPerSession > 100) {
+    return { valid: false, error: 'Cycles per session must be an integer between 1 and 100' };
+  }
+
+  let rawRestMs;
+  if (cfg.restMs !== undefined) {
+    rawRestMs = cfg.restMs;
+  } else if (cfg.rest_ms !== undefined) {
+    rawRestMs = cfg.rest_ms;
+  } else if (cfg.restSec !== undefined) {
+    const secStr = String(cfg.restSec).trim();
+    if (secStr === '' || !/^[+-]?\d+(\.\d+)?$/.test(secStr)) {
+      return { valid: false, error: 'Rest duration must be an integer between 0 ms and 3600000 ms (0–3600 s)' };
+    }
+    const sec = Number(secStr);
+    rawRestMs = Number.isFinite(sec) ? Math.round(sec * 1000) : NaN;
+  } else {
+    rawRestMs = DEFAULT_CONFIG.restMs;
+  }
+  const restMs = Number(rawRestMs);
+  if (!Number.isInteger(restMs) || restMs < 0 || restMs > 3600000) {
+    return { valid: false, error: 'Rest duration must be an integer between 0 ms and 3600000 ms (0–3600 s)' };
+  }
+
   return {
     valid: true,
     error: null,
-    values: { openAngle, closeAngle, holdMs },
+    values: { openAngle, closeAngle, holdMs, cyclesPerSession, restMs },
   };
 }
 
@@ -93,8 +127,8 @@ function createAppState(initial = {}) {
     config: { ...DEFAULT_CONFIG },
     sequenceDirty: false,
     servos: {
-      1: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', timer: null, presets: [...DEFAULT_PRESETS] },
-      2: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', timer: null, presets: [...DEFAULT_PRESETS] },
+      1: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', cycle: 0, restRemainingMs: 0, attached: true, timer: null, presets: [...DEFAULT_PRESETS] },
+      2: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', cycle: 0, restRemainingMs: 0, attached: true, timer: null, presets: [...DEFAULT_PRESETS] },
     },
     relays: {
       1: false,
@@ -136,10 +170,14 @@ function applyStatusToState(state, data) {
   if (Array.isArray(data.servos)) {
     data.servos.forEach((s) => {
       if (s && (s.id === 1 || s.id === 2)) {
-        state.servos[s.id].angle = Number(s.angle) || 0;
+        // Conservative mapping: explicitly require true, otherwise treat as detached
+        state.servos[s.id].attached = s.attached === true;
+        state.servos[s.id].angle = Number.isFinite(s.angle) ? s.angle : (Number(s.angle) || 0);
         state.servos[s.id].running = Boolean(s.running);
         state.servos[s.id].phase = s.phase || 'idle';
         state.servos[s.id].statusText = s.status || '';
+        state.servos[s.id].cycle = Number(s.cycle) || 0;
+        state.servos[s.id].restRemainingMs = Number(s.rest_remaining_ms) || 0;
       }
     });
   }
@@ -156,6 +194,12 @@ function applyStatusToState(state, data) {
     state.config.openAngle = data.sequence.open_deg;
     state.config.closeAngle = data.sequence.close_deg;
     state.config.holdMs = data.sequence.hold_ms;
+    if (data.sequence.cycles_per_session !== undefined) {
+      state.config.cyclesPerSession = data.sequence.cycles_per_session;
+    }
+    if (data.sequence.rest_ms !== undefined) {
+      state.config.restMs = data.sequence.rest_ms;
+    }
   }
 
   return true;
@@ -165,10 +209,13 @@ function applyStatusToState(state, data) {
  * Dispatches a POST mutation with form-urlencoded payload and X-Requested-With header.
  * Guarded against duplicate in-flight requests and bounded by timeout.
  */
-async function postApiCommand(endpoint, params = {}, actionKey = null, pendingSet = new Set(), fetchFn = globalThis.fetch, timeoutMs = 4000) {
+async function postApiCommand(endpoint, params = {}, actionKey = null, pendingSet = new Set(), fetchFn = globalThis.fetch, timeoutMs = 4000, onPending = null) {
   if (actionKey) {
     if (pendingSet.has(actionKey)) return { ok: false, duplicate: true };
     pendingSet.add(actionKey);
+    if (typeof onPending === 'function') {
+      onPending(actionKey);
+    }
   }
 
   const controller = new AbortController();
@@ -224,7 +271,7 @@ async function fetchStatus(fetchFn = globalThis.fetch, timeoutMs = 3000) {
 }
 
 /**
- * Starts continuous open->hold->close->hold alternating sequence.
+ * Starts continuous sequence of N cycles (open->hold->close->hold) then rest closed for restMs.
  * Used for file:// simulation ONLY.
  */
 function startServoRunner(servo, config, onUpdate, timerOps = {
@@ -235,27 +282,75 @@ function startServoRunner(servo, config, onUpdate, timerOps = {
     timerOps.clearTimeout(servo.timer);
     servo.timer = null;
   }
+  const openAngle = config.openAngle !== undefined ? config.openAngle : 30;
+  const closeAngle = config.closeAngle !== undefined ? config.closeAngle : 85;
+  const holdMs = config.holdMs !== undefined ? config.holdMs : 200;
+  const cyclesPerSession = config.cyclesPerSession !== undefined ? config.cyclesPerSession : 5;
+  const restMs = config.restMs !== undefined ? config.restMs : 10000;
+
   servo.running = true;
+  servo.cycle = 1;
+  servo.restRemainingMs = 0;
   servo.phase = 'open';
-  servo.angle = config.openAngle;
+  servo.angle = openAngle;
   servo.statusText = 'OPEN';
   if (typeof onUpdate === 'function') onUpdate(servo);
 
-  function next() {
+  function afterRest() {
     if (!servo.running) return;
-    servo.phase = servo.phase === 'open' ? 'close' : 'open';
-    servo.angle = servo.phase === 'open' ? config.openAngle : config.closeAngle;
-    servo.statusText = servo.phase === 'open' ? 'OPEN' : 'CLOSE';
+    servo.restRemainingMs = 0;
+    servo.cycle = 1;
+    servo.phase = 'open';
+    servo.angle = openAngle;
+    servo.statusText = 'OPEN';
     if (typeof onUpdate === 'function') onUpdate(servo);
-    servo.timer = timerOps.setTimeout(next, config.holdMs);
+    servo.timer = timerOps.setTimeout(stepClose, holdMs);
   }
 
-  servo.timer = timerOps.setTimeout(next, config.holdMs);
+  function afterClose() {
+    if (!servo.running) return;
+    if (servo.cycle >= cyclesPerSession) {
+      if (restMs > 0) {
+        servo.phase = 'rest';
+        servo.angle = closeAngle;
+        servo.statusText = 'REST';
+        servo.restRemainingMs = restMs;
+        if (typeof onUpdate === 'function') onUpdate(servo);
+        servo.timer = timerOps.setTimeout(afterRest, restMs);
+      } else {
+        servo.restRemainingMs = 0;
+        servo.cycle = 1;
+        servo.phase = 'open';
+        servo.angle = openAngle;
+        servo.statusText = 'OPEN';
+        if (typeof onUpdate === 'function') onUpdate(servo);
+        servo.timer = timerOps.setTimeout(stepClose, holdMs);
+      }
+    } else {
+      servo.cycle++;
+      servo.phase = 'open';
+      servo.angle = openAngle;
+      servo.statusText = 'OPEN';
+      if (typeof onUpdate === 'function') onUpdate(servo);
+      servo.timer = timerOps.setTimeout(stepClose, holdMs);
+    }
+  }
+
+  function stepClose() {
+    if (!servo.running) return;
+    servo.phase = 'close';
+    servo.angle = closeAngle;
+    servo.statusText = 'CLOSE';
+    if (typeof onUpdate === 'function') onUpdate(servo);
+    servo.timer = timerOps.setTimeout(afterClose, holdMs);
+  }
+
+  servo.timer = timerOps.setTimeout(stepClose, holdMs);
 }
 
 /**
  * Stops continuous sequence on a servo.
- * Cancels timer, holds current angle, and clears running state.
+ * Cancels timer, holds current angle, and clears running, cycle, and rest state.
  * Used for file:// simulation ONLY.
  */
 function stopServoRunner(servo, onUpdate, timerOps = {
@@ -268,6 +363,8 @@ function stopServoRunner(servo, onUpdate, timerOps = {
   servo.running = false;
   servo.phase = 'idle';
   servo.statusText = null;
+  servo.cycle = 0;
+  servo.restRemainingMs = 0;
   if (typeof onUpdate === 'function') onUpdate(servo);
 }
 
@@ -309,6 +406,8 @@ if (typeof window !== 'undefined') {
       servo1Preset2Err: document.getElementById('servo-1-preset-2-error'),
       servo1Error: document.getElementById('servo-1-error'),
       servo1Status: document.getElementById('servo-1-status'),
+      servo1Cycle: document.getElementById('servo-1-cycle'),
+      servo1Attach: document.getElementById('servo-1-attach'),
       servo1Run: document.getElementById('servo-1-run'),
       servo1ManualBadge: document.getElementById('servo-1-manual-badge'),
 
@@ -323,6 +422,8 @@ if (typeof window !== 'undefined') {
       servo2Preset2Err: document.getElementById('servo-2-preset-2-error'),
       servo2Error: document.getElementById('servo-2-error'),
       servo2Status: document.getElementById('servo-2-status'),
+      servo2Cycle: document.getElementById('servo-2-cycle'),
+      servo2Attach: document.getElementById('servo-2-attach'),
       servo2Run: document.getElementById('servo-2-run'),
       servo2ManualBadge: document.getElementById('servo-2-manual-badge'),
 
@@ -335,6 +436,8 @@ if (typeof window !== 'undefined') {
       cfgOpen: document.getElementById('cfg-open'),
       cfgClose: document.getElementById('cfg-close'),
       cfgHold: document.getElementById('cfg-hold'),
+      cfgCycles: document.getElementById('cfg-cycles'),
+      cfgRest: document.getElementById('cfg-rest'),
       settingsFeedback: document.getElementById('settings-feedback'),
       btnResetSettings: document.getElementById('btn-reset-settings'),
       btnSaveSettings: document.getElementById('btn-save-settings'),
@@ -392,6 +495,8 @@ if (typeof window !== 'undefined') {
       const numberElem = isS1 ? dom.servo1Number : dom.servo2Number;
       const errorElem = isS1 ? dom.servo1Error : dom.servo2Error;
       const statusElem = isS1 ? dom.servo1Status : dom.servo2Status;
+      const cycleElem = isS1 ? dom.servo1Cycle : dom.servo2Cycle;
+      const totalCycles = state.config.cyclesPerSession || 5;
 
       angleElem.textContent = `${s.angle}°`;
 
@@ -406,15 +511,31 @@ if (typeof window !== 'undefined') {
         errorElem.textContent = '';
       }
 
-      if (state.paused) {
+      if (!s.attached) {
+        statusElem.className = 'status-pill pill-detached';
+        statusElem.textContent = 'DETACHED';
+        if (cycleElem) cycleElem.style.display = 'none';
+      } else if (state.paused) {
         statusElem.className = 'status-pill pill-paused';
         statusElem.textContent = 'PAUSED';
+        if (cycleElem) cycleElem.style.display = 'none';
       } else if (s.running) {
-        statusElem.className = 'status-pill pill-running';
-        statusElem.textContent = (s.phase || s.statusText || 'OPEN').toUpperCase();
+        if (cycleElem) {
+          cycleElem.style.display = 'inline-block';
+          cycleElem.textContent = `Cycle ${s.cycle || 1}/${totalCycles}`;
+        }
+        if (s.phase === 'rest') {
+          statusElem.className = 'status-pill pill-rest';
+          const remSec = Math.max(0, Math.ceil((s.restRemainingMs || 0) / 1000));
+          statusElem.textContent = `REST (${remSec}s)`;
+        } else {
+          statusElem.className = 'status-pill pill-running';
+          statusElem.textContent = (s.phase || s.statusText || 'OPEN').toUpperCase();
+        }
       } else {
         statusElem.className = 'status-pill pill-idle';
         statusElem.textContent = 'IDLE';
+        if (cycleElem) cycleElem.style.display = 'none';
       }
     }
 
@@ -450,10 +571,21 @@ if (typeof window !== 'undefined') {
         const pVal1 = isS1 ? dom.servo1PresetVal1 : dom.servo2PresetVal1;
         const pVal2 = isS1 ? dom.servo1PresetVal2 : dom.servo2PresetVal2;
         const runBtn = isS1 ? dom.servo1Run : dom.servo2Run;
+        const attachBtn = isS1 ? dom.servo1Attach : dom.servo2Attach;
         const badge = isS1 ? dom.servo1ManualBadge : dom.servo2ManualBadge;
 
-        // Manual controls disabled if offline, paused, auto mode, running, or action pending
-        const manualLocked = !isConnected || isPaused || isAuto || s.running || isPending(`servo:${id}`) || isPending(`run:${id}`);
+        const isAttached = Boolean(s.attached);
+        const attachPending = isPending(`attachment:${id}`);
+
+        // Attach button: disabled offline or if pending; attach disabled paused; detach available paused
+        if (attachBtn) {
+          attachBtn.disabled = !isConnected || attachPending || (!isAttached && isPaused);
+          attachBtn.textContent = isAttached ? 'Detach' : 'Attach';
+          attachBtn.setAttribute('aria-label', `${isAttached ? 'Detach' : 'Attach'} Servo ${id}`);
+        }
+
+        // Manual controls disabled if offline, detached, paused, auto mode, running, or action pending
+        const manualLocked = !isConnected || !isAttached || isPaused || isAuto || s.running || isPending(`servo:${id}`) || isPending(`run:${id}`) || attachPending;
         slider.disabled = manualLocked;
         number.disabled = manualLocked;
         p1Btn.disabled = manualLocked;
@@ -461,14 +593,17 @@ if (typeof window !== 'undefined') {
         pVal1.disabled = manualLocked;
         pVal2.disabled = manualLocked;
 
-        // Start/Stop sequence allowed in Manual OR Auto; disabled if offline, paused, or pending
-        runBtn.disabled = !isConnected || isPaused || isPending(`run:${id}`);
+        // Start/Stop sequence allowed in Manual OR Auto; disabled if offline, paused, pending, or if detached and not running
+        const runLocked = !isConnected || isPaused || isPending(`run:${id}`) || attachPending || (!isAttached && !s.running);
+        runBtn.disabled = runLocked;
         runBtn.textContent = s.running ? 'Stop sequence' : 'Start sequence';
         runBtn.setAttribute('aria-label', `${s.running ? 'Stop' : 'Start'} sequence for Servo ${id}`);
         runBtn.classList.toggle('btn-stop', s.running);
 
         if (!isConnected) {
           badge.textContent = '(Connecting...)';
+        } else if (!isAttached) {
+          badge.textContent = '(Detached)';
         } else if (isPaused) {
           badge.textContent = '(Paused)';
         } else if (isAuto) {
@@ -491,6 +626,8 @@ if (typeof window !== 'undefined') {
       dom.cfgOpen.disabled = settingsLocked;
       dom.cfgClose.disabled = settingsLocked;
       dom.cfgHold.disabled = settingsLocked;
+      if (dom.cfgCycles) dom.cfgCycles.disabled = settingsLocked;
+      if (dom.cfgRest) dom.cfgRest.disabled = settingsLocked;
       dom.btnResetSettings.disabled = settingsLocked;
       if (dom.btnSaveSettings) dom.btnSaveSettings.disabled = settingsLocked;
     }
@@ -515,12 +652,23 @@ if (typeof window !== 'undefined') {
 
         const s1 = state.servos[1];
         const s2 = state.servos[2];
+        const total = state.config.cyclesPerSession || 5;
+        const formatServo = (s) => {
+          if (!s.attached) return 'detached';
+          if (!s.running) return 'idle';
+          if (s.phase === 'rest') {
+            const sec = Math.max(0, Math.ceil((s.restRemainingMs || 0) / 1000));
+            return `Cycle ${s.cycle}/${total} (Rest ${sec}s)`;
+          }
+          return `Cycle ${s.cycle}/${total} (${(s.phase || s.statusText || 'open').toUpperCase()})`;
+        };
+
         if (s1.running && s2.running) {
-          dom.statAutoDue.textContent = `Running (S1: ${s1.phase || s1.statusText}, S2: ${s2.phase || s2.statusText})`;
+          dom.statAutoDue.textContent = `Running (S1: ${formatServo(s1)}, S2: ${formatServo(s2)})`;
         } else if (s1.running) {
-          dom.statAutoDue.textContent = `Running (Servo 1: ${s1.phase || s1.statusText})`;
+          dom.statAutoDue.textContent = `Running (Servo 1: ${formatServo(s1)})`;
         } else if (s2.running) {
-          dom.statAutoDue.textContent = `Running (Servo 2: ${s2.phase || s2.statusText})`;
+          dom.statAutoDue.textContent = `Running (Servo 2: ${formatServo(s2)})`;
         } else if (state.mode === 'manual') {
           dom.statAutoDue.textContent = 'Standby (Manual)';
         } else {
@@ -534,14 +682,24 @@ if (typeof window !== 'undefined') {
       state.config.openAngle = seq.open_deg;
       state.config.closeAngle = seq.close_deg;
       state.config.holdMs = seq.hold_ms;
+      if (seq.cycles_per_session !== undefined) state.config.cyclesPerSession = seq.cycles_per_session;
+      if (seq.rest_ms !== undefined) state.config.restMs = seq.rest_ms;
 
       const isFocused = document.activeElement === dom.cfgOpen ||
                         document.activeElement === dom.cfgClose ||
-                        document.activeElement === dom.cfgHold;
+                        document.activeElement === dom.cfgHold ||
+                        document.activeElement === dom.cfgCycles ||
+                        document.activeElement === dom.cfgRest;
       if (!isFocused && !state.sequenceDirty) {
         dom.cfgOpen.value = seq.open_deg;
         dom.cfgClose.value = seq.close_deg;
         dom.cfgHold.value = seq.hold_ms;
+        if (dom.cfgCycles && seq.cycles_per_session !== undefined) {
+          dom.cfgCycles.value = seq.cycles_per_session;
+        }
+        if (dom.cfgRest && seq.rest_ms !== undefined) {
+          dom.cfgRest.value = seq.rest_ms / 1000;
+        }
       }
     }
 
@@ -557,7 +715,9 @@ if (typeof window !== 'undefined') {
     }
 
     async function executeApiPost(endpoint, params, actionKey) {
-      const res = await postApiCommand(endpoint, params, actionKey, pendingActions, window.fetch);
+      const res = await postApiCommand(endpoint, params, actionKey, pendingActions, window.fetch, 4000, () => {
+        updateControlsDisabledState();
+      });
       updateControlsDisabledState();
       if (!res.ok) {
         if (!res.duplicate) {
@@ -615,7 +775,7 @@ if (typeof window !== 'undefined') {
     // ── Simulation Handlers (file:// protocol) ──
 
     function startServoSim(id) {
-      if (state.paused) return;
+      if (state.paused || !state.servos[id].attached) return;
       startServoRunner(state.servos[id], state.config, () => {
         updateServoUI(id);
         updateControlsDisabledState();
@@ -645,8 +805,8 @@ if (typeof window !== 'undefined') {
         dom.btnModeManual.setAttribute('aria-pressed', String(!isAuto));
         if (isAuto) {
           if (!state.paused) {
-            startServoSim(1);
-            startServoSim(2);
+            if (state.servos[1].attached) startServoSim(1);
+            if (state.servos[2].attached) startServoSim(2);
           }
         } else {
           stopServoSim(1);
@@ -667,8 +827,8 @@ if (typeof window !== 'undefined') {
         dom.btnModeManual.classList.toggle('active', !isAuto);
         dom.btnModeManual.setAttribute('aria-pressed', String(!isAuto));
         if (isAuto && !state.paused) {
-          state.servos[1].running = true;
-          state.servos[2].running = true;
+          if (state.servos[1].attached) state.servos[1].running = true;
+          if (state.servos[2].attached) state.servos[2].running = true;
         } else if (!isAuto) {
           state.servos[1].running = false;
           state.servos[2].running = false;
@@ -697,8 +857,8 @@ if (typeof window !== 'undefined') {
           dom.btnPauseSim.classList.remove('paused');
           dom.btnPauseSim.setAttribute('aria-pressed', 'false');
           if (state.mode === 'auto') {
-            startServoSim(1);
-            startServoSim(2);
+            if (state.servos[1].attached) startServoSim(1);
+            if (state.servos[2].attached) startServoSim(2);
           }
         }
         updateServoUI(1);
@@ -719,8 +879,8 @@ if (typeof window !== 'undefined') {
           state.servos[1].running = false;
           state.servos[2].running = false;
         } else if (state.mode === 'auto') {
-          state.servos[1].running = true;
-          state.servos[2].running = true;
+          if (state.servos[1].attached) state.servos[1].running = true;
+          if (state.servos[2].attached) state.servos[2].running = true;
         }
         updateServoUI(1);
         updateServoUI(2);
@@ -730,8 +890,9 @@ if (typeof window !== 'undefined') {
     }
 
     async function toggleServoRun(id) {
-      if (!state.connected || state.paused || isPending(`run:${id}`)) return;
+      if (!state.connected || state.paused || isPending(`run:${id}`) || isPending(`attachment:${id}`)) return;
       const s = state.servos[id];
+      if (!s.attached && !s.running) return;
       const nextRunning = !s.running;
 
       if (isFilePreview) {
@@ -745,7 +906,55 @@ if (typeof window !== 'undefined') {
       if (res.ok) {
         s.running = nextRunning;
         s.phase = nextRunning ? 'open' : 'idle';
-        s.statusText = nextRunning ? 'OPEN' : 'IDLE';
+        s.statusText = nextRunning ? 'OPEN' : (s.attached ? 'IDLE' : 'DETACHED');
+        updateServoUI(id);
+        updateControlsDisabledState();
+        updateStatusBar();
+      }
+    }
+
+    async function toggleAttachment(id) {
+      if (!state.connected || isPending(`attachment:${id}`)) return;
+      const s = state.servos[id];
+      const nextAttached = !s.attached;
+
+      // Reject attach while paused (detach always permitted)
+      if (nextAttached && state.paused) return;
+      // Guard attaching when run or angle is in-flight; detach is always permitted even with angle pending
+      if (nextAttached && (isPending(`run:${id}`) || isPending(`servo:${id}`))) return;
+
+      if (isFilePreview) {
+        s.attached = nextAttached;
+        if (!nextAttached) {
+          stopServoSim(id);
+          s.statusText = 'DETACHED';
+          s.phase = 'idle';
+          s.running = false;
+          s.cycle = 0;
+          s.restRemainingMs = 0;
+        } else {
+          stopServoSim(id);
+          s.statusText = 'IDLE';
+          s.phase = 'idle';
+          s.running = false;
+          s.cycle = 0;
+          s.restRemainingMs = 0;
+        }
+        updateServoUI(id);
+        updateControlsDisabledState();
+        updateStatusBar();
+        return;
+      }
+
+      // Live HTTP POST /api/attachment
+      const res = await executeApiPost('/api/attachment', { id, attached: nextAttached ? 1 : 0 }, `attachment:${id}`);
+      if (res.ok) {
+        s.attached = nextAttached;
+        s.running = false;
+        s.cycle = 0;
+        s.restRemainingMs = 0;
+        s.phase = 'idle';
+        s.statusText = nextAttached ? 'IDLE' : 'DETACHED';
         updateServoUI(id);
         updateControlsDisabledState();
         updateStatusBar();
@@ -753,7 +962,7 @@ if (typeof window !== 'undefined') {
     }
 
     async function sendServoAngle(id, rawAngle) {
-      if (!state.connected || state.paused || state.mode !== 'manual' || state.servos[id].running || isPending(`servo:${id}`)) return;
+      if (!state.connected || state.paused || state.mode !== 'manual' || !state.servos[id].attached || state.servos[id].running || isPending(`servo:${id}`) || isPending(`attachment:${id}`) || isPending(`run:${id}`)) return;
       const res = validateServoAngle(rawAngle);
       if (!res.valid) return;
 
@@ -940,6 +1149,13 @@ if (typeof window !== 'undefined') {
     dom.btnModeAuto.addEventListener('click', () => setMode('auto'));
     dom.btnPauseSim.addEventListener('click', togglePause);
 
+    if (dom.servo1Attach) {
+      dom.servo1Attach.addEventListener('click', () => toggleAttachment(1));
+    }
+    if (dom.servo2Attach) {
+      dom.servo2Attach.addEventListener('click', () => toggleAttachment(2));
+    }
+
     dom.servo1Run.addEventListener('click', () => toggleServoRun(1));
     dom.servo2Run.addEventListener('click', () => toggleServoRun(2));
 
@@ -947,7 +1163,7 @@ if (typeof window !== 'undefined') {
     dom.relay2Toggle.addEventListener('change', (e) => handleRelayToggle(2, e.target.checked));
 
     // Sequence Settings Form Dirty Tracking
-    [dom.cfgOpen, dom.cfgClose, dom.cfgHold].forEach((el) => {
+    [dom.cfgOpen, dom.cfgClose, dom.cfgHold, dom.cfgCycles, dom.cfgRest].forEach((el) => {
       if (el) el.addEventListener('input', () => { state.sequenceDirty = true; });
     });
 
@@ -960,6 +1176,8 @@ if (typeof window !== 'undefined') {
         openAngle: dom.cfgOpen.value.trim(),
         closeAngle: dom.cfgClose.value.trim(),
         holdMs: dom.cfgHold.value.trim(),
+        cyclesPerSession: dom.cfgCycles ? dom.cfgCycles.value.trim() : DEFAULT_CONFIG.cyclesPerSession,
+        restSec: dom.cfgRest ? dom.cfgRest.value.trim() : (DEFAULT_CONFIG.restMs / 1000),
       };
 
       const result = validateSettings(candidate);
@@ -988,6 +1206,8 @@ if (typeof window !== 'undefined') {
         open_deg: result.values.openAngle,
         close_deg: result.values.closeAngle,
         hold_ms: result.values.holdMs,
+        cycles_per_session: result.values.cyclesPerSession,
+        rest_ms: result.values.restMs,
       }, 'sequence');
 
       if (res.ok) {
@@ -1011,8 +1231,10 @@ if (typeof window !== 'undefined') {
         dom.cfgOpen.value = DEFAULT_CONFIG.openAngle;
         dom.cfgClose.value = DEFAULT_CONFIG.closeAngle;
         dom.cfgHold.value = DEFAULT_CONFIG.holdMs;
+        if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
+        if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Factory defaults restored (30°/85°, 200ms).';
+        dom.settingsFeedback.textContent = 'Factory defaults restored (30°/85°, 200ms, 5 cycles, 10s rest).';
         [1, 2].forEach((id) => {
           if (state.servos[id].running && !state.paused) {
             startServoSim(id);
@@ -1030,8 +1252,10 @@ if (typeof window !== 'undefined') {
         dom.cfgOpen.value = DEFAULT_CONFIG.openAngle;
         dom.cfgClose.value = DEFAULT_CONFIG.closeAngle;
         dom.cfgHold.value = DEFAULT_CONFIG.holdMs;
+        if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
+        if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Factory defaults restored on device (30°/85°, 200ms).';
+        dom.settingsFeedback.textContent = 'Factory defaults restored on device (30°/85°, 200ms, 5 cycles, 10s rest).';
       } else {
         dom.settingsFeedback.className = 'feedback-msg feedback-error';
         dom.settingsFeedback.textContent = res.error || 'Failed to reset sequence defaults.';
@@ -1045,6 +1269,8 @@ if (typeof window !== 'undefined') {
       if (dom.infoConnMode) dom.infoConnMode.textContent = 'Offline preview (file:// protocol)';
       dom.btnPauseSim.textContent = 'Pause Sim';
       state.connected = true;
+      if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
+      if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
       updateServoUI(1);
       updateServoUI(2);
       updateRelayUI(1);
@@ -1072,12 +1298,14 @@ async function runSelfTest() {
     if (!cond) throw new Error(`Self-test failed: ${msg}`);
   }
 
-  // 1. Sequence Configuration Validation (3 parameters, no interval)
+  // 1. Sequence Configuration Validation (5 parameters: open, close, hold, cycles, rest)
   const validDefault = validateSettings(DEFAULT_CONFIG);
   assert(validDefault.valid === true, 'Default sequence config must be valid');
   assert(validDefault.values.openAngle === 30, 'Parsed open angle should be 30');
   assert(validDefault.values.closeAngle === 85, 'Parsed close angle should be 85');
   assert(validDefault.values.holdMs === 200, 'Parsed hold ms should be 200');
+  assert(validDefault.values.cyclesPerSession === 5, 'Parsed cycles per session should be 5');
+  assert(validDefault.values.restMs === 10000, 'Parsed rest ms should be 10000');
   assert(!('intervalSec' in validDefault.values), 'Repeat interval must not exist in validated output');
 
   assert(!validateSettings({ openAngle: 30, closeAngle: 30, holdMs: 200 }).valid, 'Identical open & close angles rejected');
@@ -1091,6 +1319,39 @@ async function runSelfTest() {
   assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 5001 }).valid, 'Hold delay > 5000ms rejected');
   assert(!validateSettings(null).valid, 'Null config rejected');
   assert(!validateSettings(undefined).valid, 'Undefined config rejected');
+
+  // cycles_per_session range validation (1..100)
+  assert(validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 1 }).valid === true, 'Cycles 1 is valid');
+  assert(validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 100 }).valid === true, 'Cycles 100 is valid');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 0 }).valid, 'Cycles < 1 rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 101 }).valid, 'Cycles > 100 rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 2.5 }).valid, 'Non-integer cycles rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 'abc' }).valid, 'Non-numeric cycles rejected');
+
+  // rest_ms range validation (0..3600000) & explicit seconds conversion
+  assert(validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restMs: 0 }).valid === true, 'Rest 0 ms is valid');
+  assert(validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restMs: 3600000 }).valid === true, 'Rest 3600000 ms is valid');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restMs: -1 }).valid, 'Negative rest rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restMs: 3600001 }).valid, 'Rest > 3600000 ms rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restMs: 100.5 }).valid, 'Non-integer restMs rejected');
+
+  const secConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 15 });
+  assert(secConversion.valid === true && secConversion.values.restMs === 15000, 'Explicit conversion of restSec (15s -> 15000ms)');
+  const zeroSecConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: '0' });
+  assert(zeroSecConversion.valid === true && zeroSecConversion.values.restMs === 0, 'Explicit conversion of restSec ("0" -> 0ms)');
+  const maxSecConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 3600 });
+  assert(maxSecConversion.valid === true && maxSecConversion.values.restMs === 3600000, 'Explicit conversion of restSec (3600s -> 3600000ms)');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 3601 }).valid, 'Rest > 3600s rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 'xyz' }).valid, 'Non-numeric restSec rejected');
+
+  // Fractional seconds conversion & roundtrip preservation (no Math.round on seq.rest_ms / 1000)
+  const fracConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 2.5 });
+  assert(fracConversion.valid === true && fracConversion.values.restMs === 2500, 'Fractional restSec (2.5s -> 2500ms)');
+  assert(fracConversion.values.restMs / 1000 === 2.5, 'Fractional seconds roundtrip preservation (2500ms / 1000 === 2.5s)');
+
+  const fineFracConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 0.125 });
+  assert(fineFracConversion.valid === true && fineFracConversion.values.restMs === 125, 'Millisecond-precision restSec (0.125s -> 125ms)');
+  assert(fineFracConversion.values.restMs / 1000 === 0.125, 'Millisecond-precision roundtrip (125ms / 1000 === 0.125s)');
 
   // 2. Servo Angle Validation (Integer 0..180)
   assert(validateServoAngle(30).valid === true && validateServoAngle(30).value === 30, 'Integer 30 should be valid');
@@ -1117,19 +1378,21 @@ async function runSelfTest() {
   // 4. Form UrlEncoding Serializer
   assert(serializeFormUrlEncoded({ id: 1, running: 1 }) === 'id=1&running=1', 'Form serialization produces urlencoded key-value pairs');
   assert(serializeFormUrlEncoded({ mode: 'auto' }) === 'mode=auto', 'Mode serialization');
-  assert(serializeFormUrlEncoded({ open_deg: 30, close_deg: 85, hold_ms: 200 }) === 'open_deg=30&close_deg=85&hold_ms=200', 'Sequence serialization');
+  assert(serializeFormUrlEncoded({ open_deg: 30, close_deg: 85, hold_ms: 200, cycles_per_session: 5, rest_ms: 10000 }) === 'open_deg=30&close_deg=85&hold_ms=200&cycles_per_session=5&rest_ms=10000', 'Sequence serialization');
 
   // 5. API Mapping Verification (Endpoints & Parameters)
   const apiMap = [
     { name: 'run', url: '/api/run', params: { id: 1, running: 1 }, expected: 'id=1&running=1' },
     { name: 'run_stop', url: '/api/run', params: { id: 2, running: 0 }, expected: 'id=2&running=0' },
+    { name: 'attachment_detach', url: '/api/attachment', params: { id: 1, attached: 0 }, expected: 'id=1&attached=0' },
+    { name: 'attachment_attach', url: '/api/attachment', params: { id: 2, attached: 1 }, expected: 'id=2&attached=1' },
     { name: 'servo', url: '/api/servo', params: { id: 1, angle: 45 }, expected: 'id=1&angle=45' },
     { name: 'mode_auto', url: '/api/mode', params: { mode: 'auto' }, expected: 'mode=auto' },
     { name: 'mode_manual', url: '/api/mode', params: { mode: 'manual' }, expected: 'mode=manual' },
     { name: 'pause', url: '/api/pause', params: { paused: 1 }, expected: 'paused=1' },
     { name: 'resume', url: '/api/pause', params: { paused: 0 }, expected: 'paused=0' },
     { name: 'relay', url: '/api/relay', params: { id: 1, state: 1 }, expected: 'id=1&state=1' },
-    { name: 'sequence', url: '/api/sequence', params: { open_deg: 30, close_deg: 85, hold_ms: 200 }, expected: 'open_deg=30&close_deg=85&hold_ms=200' },
+    { name: 'sequence', url: '/api/sequence', params: { open_deg: 30, close_deg: 85, hold_ms: 200, cycles_per_session: 5, rest_ms: 10000 }, expected: 'open_deg=30&close_deg=85&hold_ms=200&cycles_per_session=5&rest_ms=10000' },
     { name: 'sequence_reset', url: '/api/sequence/reset', params: {}, expected: '' },
   ];
 
@@ -1150,19 +1413,36 @@ async function runSelfTest() {
     ap_ip: '192.168.10.1',
     mdns: 'mcu-eye-monster',
     servos: [
-      { id: 1, angle: 30, running: true, phase: 'open', status: 'OPEN' },
-      { id: 2, angle: 85, running: true, phase: 'close', status: 'CLOSE' },
+      { id: 1, angle: 30, running: true, phase: 'open', status: 'OPEN', cycle: 2, rest_remaining_ms: 0, attached: true },
+      { id: 2, angle: 85, running: true, phase: 'rest', status: 'REST', cycle: 5, rest_remaining_ms: 8500, attached: true },
     ],
     relays: [{ id: 1, state: 1 }, { id: 2, state: 0 }],
-    sequence: { open_deg: 40, close_deg: 90, hold_ms: 300 },
+    sequence: { open_deg: 40, close_deg: 90, hold_ms: 300, cycles_per_session: 8, rest_ms: 15000 },
   };
 
   assert(applyStatusToState(mockState, validStatus) === true, 'Valid status payload parses successfully');
   assert(mockState.mode === 'auto', 'Mode parsed as auto');
+  assert(mockState.servos[1].attached === true, 'Servo 1 attached parsed as true');
+  assert(mockState.servos[2].attached === true, 'Servo 2 attached parsed as true');
   assert(mockState.servos[1].running === true && mockState.servos[1].phase === 'open', 'Servo 1 running state parsed');
-  assert(mockState.servos[2].angle === 85 && mockState.servos[2].phase === 'close', 'Servo 2 angle and phase parsed');
+  assert(mockState.servos[1].cycle === 2 && mockState.servos[1].restRemainingMs === 0, 'Servo 1 cycle and rest parsed');
+  assert(mockState.servos[2].angle === 85 && mockState.servos[2].phase === 'rest', 'Servo 2 angle and phase parsed');
+  assert(mockState.servos[2].cycle === 5 && mockState.servos[2].restRemainingMs === 8500, 'Servo 2 cycle and rest parsed');
   assert(mockState.relays[1] === true && mockState.relays[2] === false, 'Relays parsed');
   assert(mockState.config.openAngle === 40 && mockState.config.holdMs === 300, 'Sequence config parsed');
+  assert(mockState.config.cyclesPerSession === 8 && mockState.config.restMs === 15000, 'Cycles and rest config parsed');
+
+  // Conservative attached mapping verification
+  const detachedPayload = {
+    servos: [
+      { id: 1, angle: 30, running: false, phase: 'idle', status: 'DETACHED', attached: false },
+      { id: 2, angle: 30, running: false, phase: 'idle', status: 'DETACHED' }, // attached omitted -> conservative false
+    ],
+  };
+  applyStatusToState(mockState, detachedPayload);
+  assert(mockState.servos[1].attached === false, 'Explicit attached: false parsed as false');
+  assert(mockState.servos[1].statusText === 'DETACHED', 'DETACHED status parsed');
+  assert(mockState.servos[2].attached === false, 'Conservative mapping: missing attached treated as false');
 
   // Malformed payload resiliency checks
   assert(applyStatusToState(mockState, null) === false, 'Null payload handled safely');
@@ -1269,6 +1549,98 @@ async function runSelfTest() {
   assert(succToggle.ok === true, 'Relay mutation succeeds');
   assert(testRelayState === true, 'Relay updated to true on mutation success');
 
+  // 10.1 Motion Gating & Optimistic Resume Safety Tests
+  const gatingState = createAppState({
+    connected: true,
+    mode: 'manual',
+    servos: {
+      1: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', attached: true },
+      2: { angle: 30, running: false, phase: 'idle', statusText: 'DETACHED', attached: false },
+    },
+  });
+
+  // Gating: angle command rejected on detached servo
+  function canSendAngle(state, id) {
+    return state.connected && !state.paused && state.mode === 'manual' && Boolean(state.servos[id].attached) && !state.servos[id].running;
+  }
+  assert(canSendAngle(gatingState, 1) === true, 'Attached idle servo can accept angle commands');
+  assert(canSendAngle(gatingState, 2) === false, 'Detached servo rejects angle commands');
+
+  // Gating: start sequence rejected on detached servo
+  function canStartSequence(state, id) {
+    return state.connected && !state.paused && Boolean(state.servos[id].attached);
+  }
+  assert(canStartSequence(gatingState, 1) === true, 'Attached servo can start sequence');
+  assert(canStartSequence(gatingState, 2) === false, 'Detached servo cannot start sequence');
+
+  // Mode switch to auto: only attached servos marked running
+  if (gatingState.servos[1].attached) gatingState.servos[1].running = true;
+  if (gatingState.servos[2].attached) gatingState.servos[2].running = true;
+  assert(gatingState.servos[1].running === true, 'Attached servo 1 starts running on auto');
+  assert(gatingState.servos[2].running === false, 'Detached servo 2 never optimistically starts running in auto');
+
+  // Pause / Resume: only attached servos resume running
+  gatingState.paused = true;
+  gatingState.servos[1].running = false;
+  gatingState.paused = false;
+  if (gatingState.servos[1].attached) gatingState.servos[1].running = true;
+  if (gatingState.servos[2].attached) gatingState.servos[2].running = true;
+  assert(gatingState.servos[1].running === true, 'Attached servo 1 resumes running on unpause');
+  assert(gatingState.servos[2].running === false, 'Detached servo 2 never resumes running on unpause');
+
+  // Attach rejected while paused; detach allowed while paused
+  const isAttachAllowed = (paused, nextAttached) => !(paused && nextAttached);
+  assert(isAttachAllowed(true, true) === false, 'Attach is rejected when firmware is paused');
+  assert(isAttachAllowed(true, false) === true, 'Detach is allowed when firmware is paused');
+  assert(isAttachAllowed(false, true) === true, 'Attach is allowed when firmware is unpaused');
+
+  // Pending input guards: sendServoAngle guarded when angle, attachment, or run is pending
+  gatingState.servos[1].running = false;
+  function canSendAngleWithPending(state, id, pendingSet) {
+    return state.connected && !state.paused && state.mode === 'manual' &&
+           Boolean(state.servos[id].attached) && !state.servos[id].running &&
+           !pendingSet.has(`servo:${id}`) &&
+           !pendingSet.has(`attachment:${id}`) &&
+           !pendingSet.has(`run:${id}`);
+  }
+  const pendingTestSet = new Set();
+  assert(canSendAngleWithPending(gatingState, 1, pendingTestSet) === true, 'Can send angle when no actions pending');
+  pendingTestSet.add('attachment:1');
+  assert(canSendAngleWithPending(gatingState, 1, pendingTestSet) === false, 'Blocked from sending angle when attachment pending');
+  pendingTestSet.delete('attachment:1');
+  pendingTestSet.add('run:1');
+  assert(canSendAngleWithPending(gatingState, 1, pendingTestSet) === false, 'Blocked from sending angle when run pending');
+  pendingTestSet.delete('run:1');
+  pendingTestSet.add('servo:1');
+  assert(canSendAngleWithPending(gatingState, 1, pendingTestSet) === false, 'Blocked from sending angle when servo angle pending');
+
+  // Keep detach available when angle is pending:
+  function canToggleAttachmentWithPending(state, id, pendingSet, nextAttached) {
+    if (!state.connected || pendingSet.has(`attachment:${id}`)) return false;
+    if (nextAttached && state.paused) return false;
+    if (nextAttached && (pendingSet.has(`run:${id}`) || pendingSet.has(`servo:${id}`))) return false;
+    return true;
+  }
+  // When angle is pending (servo:1), detaching (nextAttached: false) remains available:
+  assert(canToggleAttachmentWithPending(gatingState, 1, pendingTestSet, false) === true, 'Detach remains available when angle command is pending');
+  // But attach (nextAttached: true) is guarded when angle is pending:
+  assert(canToggleAttachmentWithPending(gatingState, 1, pendingTestSet, true) === false, 'Attach blocked when angle command is pending');
+  pendingTestSet.delete('servo:1');
+
+  // executeApiPost / postApiCommand onPending callback immediate execution test
+  let onPendingCalledImmediate = false;
+  let inFlightPendingSeen = false;
+  const mockPendingSet = new Set();
+  await postApiCommand('/api/test', {}, 'test:1', mockPendingSet, async () => {
+    inFlightPendingSeen = mockPendingSet.has('test:1');
+    return { ok: true, json: async () => ({ ok: true }) };
+  }, 4000, () => {
+    onPendingCalledImmediate = mockPendingSet.has('test:1');
+  });
+  assert(onPendingCalledImmediate === true, 'onPending called immediately while pendingSet contains entry');
+  assert(inFlightPendingSeen === true, 'pending entry active during in-flight fetch');
+  assert(mockPendingSet.size === 0, 'pending entry cleared after post completes');
+
   // 11. Fake Timer for Simulation Runner Test
   function createFakeTimer() {
     let now = 0;
@@ -1284,23 +1656,24 @@ async function runSelfTest() {
         timers.delete(id);
       },
       tick(ms) {
-        now += ms;
-        let ran = true;
-        while (ran) {
-          ran = false;
+        const target = now + ms;
+        while (true) {
           let earliestId = null;
           let earliestDue = Infinity;
           for (const [id, t] of timers.entries()) {
-            if (t.due <= now && t.due < earliestDue) {
+            if (t.due <= target && t.due < earliestDue) {
               earliestId = id;
               earliestDue = t.due;
             }
           }
           if (earliestId !== null) {
+            now = earliestDue;
             const { fn } = timers.get(earliestId);
             timers.delete(earliestId);
             fn();
-            ran = true;
+          } else {
+            now = target;
+            break;
           }
         }
       },
@@ -1311,21 +1684,118 @@ async function runSelfTest() {
   }
 
   const fakeTimer = createFakeTimer();
-  const testServo = { angle: 0, running: false, phase: 'idle', timer: null, statusText: null };
-  const testCfg = { openAngle: 30, closeAngle: 85, holdMs: 200 };
+  const testServo = { angle: 0, running: false, phase: 'idle', cycle: 0, restRemainingMs: 0, timer: null, statusText: null };
+  const testCfg = { openAngle: 30, closeAngle: 85, holdMs: 200, cyclesPerSession: 2, restMs: 1000 };
 
+  // 11.1 Full session cycles + rest + loop repeat
   startServoRunner(testServo, testCfg, null, fakeTimer);
   assert(testServo.running === true, 'Runner sets running = true');
-  assert(testServo.phase === 'open', 'Starts at open phase');
+  assert(testServo.cycle === 1, 'Initial cycle is 1');
+  assert(testServo.phase === 'open', 'Initial phase is open');
   assert(testServo.angle === 30, 'Initial angle is openAngle');
-  fakeTimer.tick(200);
+  assert(testServo.restRemainingMs === 0, 'No rest remaining during cycle 1 open');
+
+  fakeTimer.tick(200); // Step close cycle 1
+  assert(testServo.cycle === 1, 'Cycle is still 1 during close');
   assert(testServo.phase === 'close', 'Transitions to close after holdMs');
   assert(testServo.angle === 85, 'Angle is closeAngle');
-  fakeTimer.tick(200);
-  assert(testServo.phase === 'open', 'Transitions back to open');
+
+  fakeTimer.tick(200); // Step open cycle 2
+  assert(testServo.cycle === 2, 'Transitions to cycle 2');
+  assert(testServo.phase === 'open', 'Cycle 2 phase is open');
+  assert(testServo.angle === 30, 'Angle is openAngle');
+
+  fakeTimer.tick(200); // Step close cycle 2
+  assert(testServo.cycle === 2, 'Cycle 2 close');
+  assert(testServo.phase === 'close', 'Transitions to close');
+  assert(testServo.angle === 85, 'Angle is closeAngle');
+
+  fakeTimer.tick(200); // Cycles complete -> Enter rest
+  assert(testServo.phase === 'rest', 'Transitions to rest phase after N cycles');
+  assert(testServo.angle === 85, 'Rest position default closed');
+  assert(testServo.statusText === 'REST', 'Rest statusText is REST');
+  assert(testServo.restRemainingMs === 1000, 'Rest remaining ms matches config');
+  assert(testServo.running === true, 'Servo still running during rest');
+
+  fakeTimer.tick(1000); // Rest complete -> Next session cycle 1
+  assert(testServo.cycle === 1, 'Session restarts at cycle 1');
+  assert(testServo.phase === 'open', 'Restarts at open phase');
+  assert(testServo.angle === 30, 'Restarts at open angle');
+  assert(testServo.restRemainingMs === 0, 'Rest remaining reset to 0');
+
+  // 11.2 Cancellation during active cycle
   stopServoRunner(testServo, null, fakeTimer);
   assert(testServo.running === false, 'Stopped runner has running = false');
+  assert(testServo.phase === 'idle', 'Phase reset to idle on stop');
+  assert(testServo.cycle === 0, 'Cycle cleared to 0 on stop');
+  assert(testServo.restRemainingMs === 0, 'Rest remaining cleared on stop');
   assert(fakeTimer.count === 0, 'Timers cleared after stop');
+
+  // 11.3 Cancellation during rest phase
+  startServoRunner(testServo, testCfg, null, fakeTimer);
+  fakeTimer.tick(800); // Advance to rest phase (200 + 200 + 200 + 200 = 800)
+  assert(testServo.phase === 'rest', 'Should be in rest phase');
+  fakeTimer.tick(300); // Partway through rest
+  stopServoRunner(testServo, null, fakeTimer);
+  assert(testServo.running === false, 'Stop during rest halts sequence');
+  assert(testServo.phase === 'idle', 'Phase is idle after stop during rest');
+  assert(testServo.cycle === 0, 'Cycle is 0 after stop during rest');
+  assert(testServo.restRemainingMs === 0, 'Rest remaining is 0 after stop');
+  assert(fakeTimer.count === 0, 'All timers cleared');
+
+  // 11.4 Zero rest (restMs: 0)
+  const zeroRestCfg = { openAngle: 30, closeAngle: 85, holdMs: 150, cyclesPerSession: 2, restMs: 0 };
+  startServoRunner(testServo, zeroRestCfg, null, fakeTimer);
+  fakeTimer.tick(150); // cycle 1 close
+  fakeTimer.tick(150); // cycle 2 open
+  fakeTimer.tick(150); // cycle 2 close
+  fakeTimer.tick(150); // cycle 2 close completes -> 0 rest -> immediately cycle 1 open!
+  assert(testServo.cycle === 1, 'With 0 rest, immediately starts cycle 1');
+  assert(testServo.phase === 'open', 'With 0 rest, starts cycle 1 open');
+  assert(testServo.angle === 30, 'Angle is open angle');
+  stopServoRunner(testServo, null, fakeTimer);
+
+  // 11.5 Session restart / settings save resets progress to cycle 1
+  startServoRunner(testServo, testCfg, null, fakeTimer);
+  fakeTimer.tick(300); // mid-sequence
+  startServoRunner(testServo, { ...testCfg, cyclesPerSession: 10 }, null, fakeTimer);
+  assert(testServo.cycle === 1, 'Restart resets progress to cycle 1');
+  assert(testServo.phase === 'open', 'Restart starts at open phase');
+  stopServoRunner(testServo, null, fakeTimer);
+
+  // 11.6 Detach cancels running sequence and rest, resets cycle and timers
+  const simTestServo = { angle: 30, running: false, phase: 'idle', cycle: 0, restRemainingMs: 0, attached: true, timer: null, statusText: 'IDLE' };
+  startServoRunner(simTestServo, testCfg, null, fakeTimer);
+  fakeTimer.tick(200); // running cycle 1
+  assert(simTestServo.running === true, 'Runner is running before detach');
+  stopServoRunner(simTestServo, null, fakeTimer);
+  simTestServo.attached = false;
+  simTestServo.statusText = 'DETACHED';
+  assert(simTestServo.running === false, 'Runner stopped on detach');
+  assert(simTestServo.phase === 'idle', 'Phase is idle on detach');
+  assert(simTestServo.cycle === 0, 'Cycle cleared on detach');
+  assert(simTestServo.restRemainingMs === 0, 'Rest remaining cleared on detach');
+  assert(simTestServo.statusText === 'DETACHED', 'Status is DETACHED');
+  assert(fakeTimer.count === 0, 'All simulation timers cleared on detach');
+
+  // Detach during rest phase cancels rest
+  simTestServo.attached = true;
+  startServoRunner(simTestServo, testCfg, null, fakeTimer);
+  fakeTimer.tick(800); // advance to rest phase
+  assert(simTestServo.phase === 'rest', 'In rest phase before detach');
+  stopServoRunner(simTestServo, null, fakeTimer);
+  simTestServo.attached = false;
+  simTestServo.statusText = 'DETACHED';
+  assert(simTestServo.running === false, 'Stopped during rest');
+  assert(simTestServo.restRemainingMs === 0, 'Rest cleared on detach');
+  assert(simTestServo.statusText === 'DETACHED', 'Status text is DETACHED');
+
+  // Attach leaves servo idle stopped
+  simTestServo.attached = true;
+  simTestServo.statusText = 'IDLE';
+  assert(simTestServo.running === false, 'Attach leaves servo stopped');
+  assert(simTestServo.cycle === 0 && simTestServo.restRemainingMs === 0, 'Cycle and rest remain 0 on attach');
+  assert(simTestServo.statusText === 'IDLE', 'Status is IDLE on attach');
 
   // 12. DOM Contract Verification against root index.html
   if (typeof require !== 'undefined') {
@@ -1347,6 +1817,7 @@ async function runSelfTest() {
         'stat-auto-due',
         'card-servo-1',
         'servo-1-status',
+        'servo-1-cycle',
         'servo-1-angle',
         'servo-1-slider',
         'servo-1-manual-badge',
@@ -1359,9 +1830,11 @@ async function runSelfTest() {
         'servo-1-preset-val-2',
         'servo-1-preset-1-error',
         'servo-1-preset-2-error',
+        'servo-1-attach',
         'servo-1-run',
         'card-servo-2',
         'servo-2-status',
+        'servo-2-cycle',
         'servo-2-angle',
         'servo-2-slider',
         'servo-2-manual-badge',
@@ -1374,6 +1847,7 @@ async function runSelfTest() {
         'servo-2-preset-val-2',
         'servo-2-preset-1-error',
         'servo-2-preset-2-error',
+        'servo-2-attach',
         'servo-2-run',
         'relay-1-toggle',
         'relay-1-text',
@@ -1384,6 +1858,8 @@ async function runSelfTest() {
         'cfg-open',
         'cfg-close',
         'cfg-hold',
+        'cfg-cycles',
+        'cfg-rest',
         'settings-feedback',
         'btn-reset-settings',
         'details-device',
@@ -1405,6 +1881,9 @@ async function runSelfTest() {
       assert(!html.includes('id="cfg-interval"'), 'cfg-interval must not exist in index.html');
       assert(!html.includes('Auto Repeat Interval'), 'Auto Repeat Interval label must not exist in index.html');
       assert(html.includes('href="/update"'), 'Working /update link must exist in index.html');
+      assert(html.includes('section-caveat'), 'UI caveat note must exist in index.html');
+      assert(html.includes('may not release motor torque'), 'UI caveat clarifies torque may not be released');
+      assert(!html.includes('no holding torque'), 'UI caveat must not promise no holding torque');
     }
   }
 

@@ -59,6 +59,7 @@
       <!-- Servo Actuators -->
       <section class="section-block" aria-labelledby="servos-title">
         <h2 id="servos-title" class="section-heading">Servo Actuators</h2>
+        <p class="section-caveat">Note: Detach stops PWM signals only, not physical power; it may not release motor torque depending on hardware. Attaching restores PWM pulses and can cause sudden movement.</p>
         <div class="servos-grid">
 
           <!-- Servo 1 Card -->
@@ -68,7 +69,10 @@
                 <h3 class="servo-name">Servo 1</h3>
                 <span class="pin-tag">GPIO 5</span>
               </div>
-              <span id="servo-1-status" class="status-pill pill-idle">IDLE</span>
+              <div class="servo-status-wrap">
+                <span id="servo-1-cycle" class="cycle-pill" style="display: none;">Cycle 1/5</span>
+                <span id="servo-1-status" class="status-pill pill-idle">IDLE</span>
+              </div>
             </div>
 
             <div class="angle-display">
@@ -115,6 +119,7 @@
             </div>
 
             <div class="card-foot">
+              <button type="button" id="servo-1-attach" class="btn btn-secondary btn-attach" aria-label="Detach Servo 1" disabled>Detach</button>
               <button type="button" id="servo-1-run" class="btn btn-secondary btn-run" aria-label="Start sequence for Servo 1" disabled>Start sequence</button>
             </div>
           </article>
@@ -126,7 +131,10 @@
                 <h3 class="servo-name">Servo 2</h3>
                 <span class="pin-tag">GPIO 1</span>
               </div>
-              <span id="servo-2-status" class="status-pill pill-idle">IDLE</span>
+              <div class="servo-status-wrap">
+                <span id="servo-2-cycle" class="cycle-pill" style="display: none;">Cycle 1/5</span>
+                <span id="servo-2-status" class="status-pill pill-idle">IDLE</span>
+              </div>
             </div>
 
             <div class="angle-display">
@@ -173,6 +181,7 @@
             </div>
 
             <div class="card-foot">
+              <button type="button" id="servo-2-attach" class="btn btn-secondary btn-attach" aria-label="Detach Servo 2" disabled>Detach</button>
               <button type="button" id="servo-2-run" class="btn btn-secondary btn-run" aria-label="Start sequence for Servo 2" disabled>Start sequence</button>
             </div>
           </article>
@@ -243,6 +252,16 @@
                   <label for="cfg-hold">Hold Delay (ms)</label>
                   <input type="number" id="cfg-hold" min="50" max="5000" step="10" value="200" required disabled>
                   <span class="field-hint">50–5000 ms</span>
+                </div>
+                <div class="field-item">
+                  <label for="cfg-cycles">Cycles / Session</label>
+                  <input type="number" id="cfg-cycles" min="1" max="100" step="1" value="5" required disabled>
+                  <span class="field-hint">1–100 cycles</span>
+                </div>
+                <div class="field-item">
+                  <label for="cfg-rest">Rest Duration (s)</label>
+                  <input type="number" id="cfg-rest" min="0" max="3600" step="0.001" value="10" required disabled>
+                  <span class="field-hint">0–3600 s (converts to ms)</span>
                 </div>
               </div>
 

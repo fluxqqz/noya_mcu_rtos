@@ -301,6 +301,14 @@ body {
   color: var(--navy-800);
 }
 
+.section-caveat {
+  font-size: 0.8rem;
+  color: var(--navy-600);
+  margin-top: 0.25rem;
+  margin-bottom: 0.85rem;
+  line-height: 1.4;
+}
+
 /* Cards Shared */
 .card {
   background-color: var(--card-bg);
@@ -353,6 +361,25 @@ body {
 }
 
 /* Status Pills */
+.servo-status-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.cycle-pill {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-full);
+  background-color: #f1f5f9;
+  color: var(--navy-700);
+  border: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+
 .status-pill {
   font-family: var(--font-mono);
   font-size: 0.7rem;
@@ -378,6 +405,18 @@ body {
   background-color: var(--teal-50);
   color: var(--teal-700);
   border: 1px solid var(--teal-600);
+}
+
+.pill-rest {
+  background-color: var(--amber-50);
+  color: var(--amber-600);
+  border: 1px solid var(--amber-600);
+}
+
+.pill-detached {
+  background-color: #f1f5f9;
+  color: #64748b;
+  border: 1px solid #94a3b8;
 }
 
 /* Angle Display */
@@ -659,6 +698,13 @@ input[type="range"]::-moz-range-thumb {
 
 .card-foot {
   margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.btn-attach {
+  width: 100%;
 }
 
 /* Relays Grid */
@@ -802,7 +848,7 @@ input[type="range"]::-moz-range-thumb {
 /* Form Fields Grid */
 .fields-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 1rem;
   margin-bottom: 1rem;
 }
