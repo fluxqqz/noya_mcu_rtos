@@ -1143,6 +1143,7 @@ void loop() {
   static long long pingStart = millis();
   if (millis() - pingStart > 60000) {
     Serial.println("PING!");
+    pingStart = millis();
   }
 
   server.handleClient();
