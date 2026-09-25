@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NOYA / Control Studio - Standalone Preview</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- =========================================================================
+       Narrow Dark Navy Sidebar Navigation
+       ========================================================================= -->
+  <aside class="app-sidebar" aria-label="Main Navigation">
+    <div class="sidebar-header">
+      <div class="brand-badge">
+        <div class="brand-icon" aria-hidden="true">N</div>
+        <span class="brand-title">NOYA</span>
+      </div>
+      <div class="brand-subtitle">Control Studio</div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-section-title">Telemetry & Actuation</div>
+      <a href="#overview" class="nav-link active">
+        <span class="nav-icon" aria-hidden="true">&#9638;</span> Overview
+      </a>
+      <a href="#servos" class="nav-link">
+        <span class="nav-icon" aria-hidden="true">&#9881;</span> Servos (Active)
+      </a>
+      <a href="#relays" class="nav-link">
+        <span class="nav-icon" aria-hidden="true">&#9889;</span> Relay Bank
+      </a>
+      <a href="#sequence" class="nav-link">
+        <span class="nav-icon" aria-hidden="true">&#9193;</span> Sequence Config
+      </a>
+      <a href="#telemetry" class="nav-link">
+        <span class="nav-icon" aria-hidden="true">&#9776;</span> Servo Array (5ch)
+      </a>
+      <a href="#activity" class="nav-link">
+        <span class="nav-icon" aria-hidden="true">&#9998;</span> Activity Feed
+      </a>
+      <a href="#maintenance" class="nav-link">
+        <span class="nav-icon" aria-hidden="true">&#9964;</span> Maintenance / OTA
+      </a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="device-chip">
+        <div class="device-chip-row">
+          <span class="device-chip-label">Target:</span>
+          <span id="chip-target" class="device-chip-val">mcu-eye-monster</span>
+        </div>
+        <div class="device-chip-row">
+          <span class="device-chip-label">AP IP:</span>
+          <span id="chip-ap-ip" class="device-chip-val">192.168.10.1</span>
+        </div>
+        <div class="device-chip-row">
+          <span class="device-chip-label">Arch:</span>
+          <span id="chip-arch" class="device-chip-val">ESP32-C6 RTOS</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- =========================================================================
+       Main Canvas
+       ========================================================================= -->
+  <main class="app-canvas">
+
+    <!-- Top Notice Banner (Telemetry Mode / Live Device Notice) -->
+    <header id="sim-notice-bar" class="sim-notice-bar" role="alert">
+      <div id="sim-notice-tag" class="sim-notice-tag">&#9888; Interactive preview / no device connected, all telemetry simulated</div>
+      <div id="sim-notice-sub">Target firmware: <code>rtos_non_sensor.ino</code></div>
+    </header>
+
+    <!-- Canvas Header Bar -->
+    <div class="canvas-header">
+      <div class="header-title-block">
+        <h1>
+          Control Studio
+          <span id="sim-status-badge" class="status-badge badge-manual">MANUAL READY</span>
+        </h1>
+        <p>Real-time motion sequencing, pulse timing, and local relay coordination</p>
+      </div>
+
+      <div class="header-actions">
+        <!-- Mode Segmented Selector -->
+        <div class="mode-segmented" role="group" aria-label="Operating Mode">
+          <button id="mode-manual-btn" class="segmented-btn active" type="button" aria-pressed="true">Manual</button>
+          <button id="mode-auto-btn" class="segmented-btn" type="button" aria-pressed="false">Automatic</button>
+        </div>
+
+        <!-- Simulation Pause / Resume -->
+        <button id="pause-sim-btn" class="btn-pause" type="button">
+          <span aria-hidden="true">&#10074;&#10074;</span>
+          <span id="pause-sim-text">Pause Simulation</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Main Content Container -->
+    <div class="content-container">
+
+      <!-- =====================================================================
+           SECTION 1: Status Overview Cards
+           ===================================================================== -->
+      <section id="overview" class="section-block" aria-labelledby="overview-heading">
+        <div class="overview-grid">
+          <!-- Card 1: Operating Mode -->
+          <div class="card stat-card">
+            <div class="stat-header">
+              <span>Operating Mode</span>
+              <span aria-hidden="true">&#9673;</span>
+            </div>
+            <div id="overview-mode" class="stat-val text-teal">MANUAL</div>
+            <div class="stat-sub">Slider control unlocked</div>
+          </div>
+
+          <!-- Card 2: Simulated RTOS Node -->
+          <div class="card stat-card">
+            <div class="stat-header">
+              <span id="node-title">Target Node</span>
+              <span aria-hidden="true">&#8644;</span>
+            </div>
+            <div id="node-val" class="stat-val">ESP32 RTOS</div>
+            <div id="node-sub" class="stat-sub">Core 0 Tasks: loopServo1 &amp; loopServo2</div>
+          </div>
+
+          <!-- Card 3: Actuator Summary -->
+          <div class="card stat-card">
+            <div class="stat-header">
+              <span>Actuators Active</span>
+              <span aria-hidden="true">&#9881;</span>
+            </div>
+            <div class="stat-val">2 / 5 Servos</div>
+            <div id="overview-relays" class="stat-sub">0 / 2 Relays ON</div>
+          </div>
+
+          <!-- Card 4: Auto Countdown / Sim Uptime -->
+          <div id="sim-countdown-card" class="card stat-card">
+            <div class="stat-header">
+              <span>Auto Cycle Due</span>
+              <span aria-hidden="true">&#9202;</span>
+            </div>
+            <div id="sim-countdown-val" class="stat-val text-amber">STANDBY</div>
+            <div class="stat-sub">Uptime: <span id="uptime-val" style="font-family: var(--font-mono);">00:00</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =====================================================================
+           SECTION 2: Active Servos (Two Motion Cards with CSS Gauges)
+           ===================================================================== -->
+      <section id="servos" class="section-block" aria-labelledby="servos-heading">
+        <div class="section-header">
+          <h2 id="servos-heading" class="section-title">
+            <span>&#9881;</span> Active Servo Actuators
+          </h2>
+          <span class="section-desc">GPIO 5 &amp; GPIO 1 — FreeRTOS independent task loops</span>
+        </div>
+
+        <div class="servos-grid">
+          <!-- Servo 1 Card -->
+          <div class="card servo-card">
+            <div class="card-header-bar">
+              <div class="servo-title">
+                <span>Servo 1</span>
+                <span class="pin-tag">GPIO 5</span>
+              </div>
+              <span id="servo-1-status" class="status-badge badge-idle">IDLE</span>
+            </div>
+
+            <div class="card-body">
+              <!-- Attractive CSS / SVG Angle Gauge -->
+              <div class="gauge-wrapper">
+                <svg class="gauge-svg" viewBox="0 0 220 120" role="img" aria-label="Servo 1 angle gauge">
+                  <!-- Background Track Arc (180 deg semi-circle, radius 80, center at 110, 105) -->
+                  <path class="gauge-bg-arc" d="M 30 105 A 80 80 0 0 1 190 105" />
+                  <!-- Dynamic Colored Foreground Arc -->
+                  <path id="servo-1-gauge-arc" class="gauge-fill-arc" d="M 30 105 A 80 80 0 0 1 190 105" stroke-dasharray="47 283" />
+
+                  <!-- Tick Marks -->
+                  <g class="gauge-ticks">
+                    <text x="20" y="112" text-anchor="middle">0°</text>
+                    <text x="50" y="52" text-anchor="middle">30°</text>
+                    <text x="110" y="20" text-anchor="middle">90°</text>
+                    <text x="155" y="45" text-anchor="middle">85°</text>
+                    <text x="200" y="112" text-anchor="middle">180°</text>
+                  </g>
+
+                  <!-- Needle Indicator (Rotates from -90deg at 0° to +90deg at 180°) -->
+                  <g id="servo-1-gauge-needle" class="gauge-needle" style="transform: rotate(-60deg);">
+                    <line x1="110" y1="105" x2="110" y2="35" stroke="#0f172a" stroke-width="3.5" stroke-linecap="round" />
+                    <line x1="110" y1="35" x2="110" y2="30" stroke="#0d9488" stroke-width="4.5" stroke-linecap="round" />
+                    <circle cx="110" cy="105" r="7" class="gauge-center-pin" />
+                    <circle cx="110" cy="105" r="3" fill="#ffffff" />
+                  </g>
+                </svg>
+
+                <div class="gauge-readout">
+                  <div id="servo-1-val" class="gauge-degree">30°</div>
+                  <div id="servo-1-us" class="gauge-us">833 µs</div>
+                </div>
+              </div>
+
+              <!-- Commanded Angle Slider -->
+              <div class="control-row">
+                <div class="control-label-row">
+                  <label for="servo-1-slider">Commanded Angle</label>
+                  <span class="manual-only-note" style="display: none;">Locked in Auto</span>
+                </div>
+                <input id="servo-1-slider" class="servo-slider" type="range" min="0" max="180" step="1" value="30">
+              </div>
+
+              <!-- Quick Presets -->
+              <div class="presets-group">
+                <span class="preset-label">Presets:</span>
+                <button class="preset-btn" type="button" data-servo="1" data-angle="30">30° (Open)</button>
+                <button class="preset-btn" type="button" data-servo="1" data-angle="85">85° (Close)</button>
+                <button class="preset-btn" type="button" data-servo="1" data-angle="90">90°</button>
+                <button class="preset-btn" type="button" data-servo="1" data-angle="150">150°</button>
+              </div>
+            </div>
+
+            <div class="card-footer-actions">
+              <span id="servo-1-progress" class="progress-tag">Standby (Default: 30°)</span>
+              <button id="servo-1-run" class="btn-run-seq" type="button">
+                <span>&#9654;</span> Run Sequence
+              </button>
+            </div>
+          </div>
+
+          <!-- Servo 2 Card -->
+          <div class="card servo-card">
+            <div class="card-header-bar">
+              <div class="servo-title">
+                <span>Servo 2</span>
+                <span class="pin-tag">GPIO 1</span>
+              </div>
+              <span id="servo-2-status" class="status-badge badge-idle">IDLE</span>
+            </div>
+
+            <div class="card-body">
+              <!-- Attractive CSS / SVG Angle Gauge -->
+              <div class="gauge-wrapper">
+                <svg class="gauge-svg" viewBox="0 0 220 120" role="img" aria-label="Servo 2 angle gauge">
+                  <path class="gauge-bg-arc" d="M 30 105 A 80 80 0 0 1 190 105" />
+                  <path id="servo-2-gauge-arc" class="gauge-fill-arc" d="M 30 105 A 80 80 0 0 1 190 105" stroke-dasharray="47 283" />
+
+                  <g class="gauge-ticks">
+                    <text x="20" y="112" text-anchor="middle">0°</text>
+                    <text x="50" y="52" text-anchor="middle">30°</text>
+                    <text x="110" y="20" text-anchor="middle">90°</text>
+                    <text x="155" y="45" text-anchor="middle">85°</text>
+                    <text x="200" y="112" text-anchor="middle">180°</text>
+                  </g>
+
+                  <g id="servo-2-gauge-needle" class="gauge-needle" style="transform: rotate(-60deg);">
+                    <line x1="110" y1="105" x2="110" y2="35" stroke="#0f172a" stroke-width="3.5" stroke-linecap="round" />
+                    <line x1="110" y1="35" x2="110" y2="30" stroke="#0d9488" stroke-width="4.5" stroke-linecap="round" />
+                    <circle cx="110" cy="105" r="7" class="gauge-center-pin" />
+                    <circle cx="110" cy="105" r="3" fill="#ffffff" />
+                  </g>
+                </svg>
+
+                <div class="gauge-readout">
+                  <div id="servo-2-val" class="gauge-degree">30°</div>
+                  <div id="servo-2-us" class="gauge-us">833 µs</div>
+                </div>
+              </div>
+
+              <!-- Commanded Angle Slider -->
+              <div class="control-row">
+                <div class="control-label-row">
+                  <label for="servo-2-slider">Commanded Angle</label>
+                  <span class="manual-only-note" style="display: none;">Locked in Auto</span>
+                </div>
+                <input id="servo-2-slider" class="servo-slider" type="range" min="0" max="180" step="1" value="30">
+              </div>
+
+              <!-- Quick Presets -->
+              <div class="presets-group">
+                <span class="preset-label">Presets:</span>
+                <button class="preset-btn" type="button" data-servo="2" data-angle="30">30° (Open)</button>
+                <button class="preset-btn" type="button" data-servo="2" data-angle="85">85° (Close)</button>
+                <button class="preset-btn" type="button" data-servo="2" data-angle="90">90°</button>
+                <button class="preset-btn" type="button" data-servo="2" data-angle="150">150°</button>
+              </div>
+            </div>
+
+            <div class="card-footer-actions">
+              <span id="servo-2-progress" class="progress-tag">Standby (Default: 30°)</span>
+              <button id="servo-2-run" class="btn-run-seq" type="button">
+                <span>&#9654;</span> Run Sequence
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =====================================================================
+           SECTION 3: Relay Bank
+           ===================================================================== -->
+      <section id="relays" class="section-block" aria-labelledby="relays-heading">
+        <div class="section-header">
+          <h2 id="relays-heading" class="section-title">
+            <span>&#9889;</span> Local Relay Actuators
+          </h2>
+          <span class="section-desc">GPIO 4 &amp; GPIO 15 — Local digital state control</span>
+        </div>
+
+        <div class="relays-grid">
+          <!-- Relay 1 -->
+          <div class="card relay-card">
+            <div class="relay-info-block">
+              <div class="relay-header">
+                <span>Relay 1</span>
+                <span class="pin-tag">GPIO 4</span>
+              </div>
+              <div class="relay-meta">Output Driver 1 / Switched load</div>
+            </div>
+            <div class="relay-control-block">
+              <span id="relay-1-led" class="led-indicator" aria-hidden="true"></span>
+              <span id="relay-1-state-text" class="relay-state-label">INACTIVE / OFF</span>
+              <label class="switch" aria-label="Toggle Relay 1">
+                <input id="relay-1-toggle" type="checkbox">
+                <span class="slider-round"></span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Relay 2 -->
+          <div class="card relay-card">
+            <div class="relay-info-block">
+              <div class="relay-header">
+                <span>Relay 2</span>
+                <span class="pin-tag">GPIO 15</span>
+              </div>
+              <div class="relay-meta">Output Driver 2 / Auxiliary power</div>
+            </div>
+            <div class="relay-control-block">
+              <span id="relay-2-led" class="led-indicator" aria-hidden="true"></span>
+              <span id="relay-2-state-text" class="relay-state-label">INACTIVE / OFF</span>
+              <label class="switch" aria-label="Toggle Relay 2">
+                <input id="relay-2-toggle" type="checkbox">
+                <span class="slider-round"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =====================================================================
+           SECTION 4: Sequence Settings Form
+           ===================================================================== -->
+      <section id="sequence" class="section-block" aria-labelledby="sequence-heading">
+        <div class="section-header">
+          <h2 id="sequence-heading" class="section-title">
+            <span>&#9193;</span> Sequence Parameters (seqMove)
+          </h2>
+          <span class="section-desc">Firmware default pattern: 3× alternate open/close, park open</span>
+        </div>
+
+        <div class="card">
+          <form id="config-form" class="config-form" novalidate>
+            <div class="form-grid">
+              <div class="form-field">
+                <label for="config-open" class="field-label">Open Angle (°)</label>
+                <input id="config-open" class="field-input" type="number" min="0" max="180" value="30" required>
+                <span class="field-hint">Firmware default: 30°</span>
+              </div>
+
+              <div class="form-field">
+                <label for="config-close" class="field-label">Close Angle (°)</label>
+                <input id="config-close" class="field-input" type="number" min="0" max="180" value="85" required>
+                <span class="field-hint">Firmware default: 85°</span>
+              </div>
+
+              <div class="form-field">
+                <label for="config-hold" class="field-label">Hold Delay (ms)</label>
+                <input id="config-hold" class="field-input" type="number" min="50" max="5000" step="10" value="200" required>
+                <span class="field-hint">Per-step hold: 200 ms</span>
+              </div>
+
+              <div class="form-field">
+                <label for="config-interval" class="field-label">Auto Repeat Interval (s)</label>
+                <input id="config-interval" class="field-input" type="number" min="5" max="600" value="60" required>
+                <span class="field-hint">Auto cycle timer: 60 s</span>
+              </div>
+            </div>
+
+            <div id="form-feedback" class="form-feedback" role="status"></div>
+
+            <div class="form-footer-actions">
+              <button id="reset-config-btn" type="button" class="btn-secondary">Reset Factory Defaults</button>
+              <button type="submit" class="btn-primary">Save &amp; Apply Sequence</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- =====================================================================
+           SECTION 5: 5-Channel Servo Array Summary Table
+           ===================================================================== -->
+      <section id="telemetry" class="section-block" aria-labelledby="telemetry-heading">
+        <div class="section-header">
+          <h2 id="telemetry-heading" class="section-title">
+            <span>&#9776;</span> 5-Channel Servo Hardware Map
+          </h2>
+          <span class="section-desc">Full controller allocation: Servos [5, 1, 12, 2, 3] | Relays [4, 15]</span>
+        </div>
+
+        <div class="card table-responsive">
+          <table class="data-table" aria-label="Servo Hardware Channels">
+            <thead>
+              <tr>
+                <th>Channel Name</th>
+                <th>Hardware Pin</th>
+                <th>Task Assignment</th>
+                <th>Simulated Position</th>
+                <th>Subsystem State</th>
+                <th>Operational Range</th>
+              </tr>
+            </thead>
+            <tbody id="servo-summary-body">
+              <!-- Injected by app.js -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =====================================================================
+           SECTION 6: Live Accessible Activity Log
+           ===================================================================== -->
+      <section id="activity" class="section-block" aria-labelledby="activity-heading">
+        <div class="section-header">
+          <h2 id="activity-heading" class="section-title">
+            <span>&#9998;</span> Live Activity Stream
+          </h2>
+          <span class="section-desc">Bounded FIFO event buffer (max 50 events)</span>
+        </div>
+
+        <div class="card activity-card">
+          <div class="activity-header">
+            <span style="font-size: 0.8rem; font-weight: 600; color: var(--text-secondary);">Real-Time Event Feed</span>
+            <button id="clear-activity-btn" class="btn-xs" type="button">Clear Buffer</button>
+          </div>
+          <ul id="activity-list" class="activity-list" aria-live="polite" aria-atomic="false">
+            <!-- Injected by app.js -->
+          </ul>
+        </div>
+      </section>
+
+      <!-- =====================================================================
+           SECTION 7: Maintenance & OTA
+           ===================================================================== -->
+      <section id="maintenance" class="section-block" aria-labelledby="maint-heading">
+        <div class="section-header">
+          <h2 id="maint-heading" class="section-title">
+            <span>&#9964;</span> Maintenance &amp; ElegantOTA Endpoint
+          </h2>
+          <span class="section-desc">Firmware telemetry reference (no mock uploads)</span>
+        </div>
+
+        <div class="maintenance-grid">
+          <!-- Firmware Metadata -->
+          <div class="card maintenance-card">
+            <div class="maint-title">Firmware Network Target</div>
+            <div class="maint-list">
+              <div class="maint-row">
+                <span class="maint-k">mDNS Hostname</span>
+                <span id="maint-mdns" class="maint-v">http://mcu-eye-monster.local</span>
+              </div>
+              <div class="maint-row">
+                <span class="maint-k">AP SSID</span>
+                <span id="maint-ap-ssid" class="maint-v">mcu-eye-monster (Ch 6)</span>
+              </div>
+              <div class="maint-row">
+                <span class="maint-k">AP Network</span>
+                <span id="maint-ap-net" class="maint-v">192.168.10.1 / 255.255.255.0</span>
+              </div>
+              <div class="maint-row">
+                <span class="maint-k">Station WiFi</span>
+                <span id="maint-sta-ip" class="maint-v">Arthatronic (STA)</span>
+              </div>
+              <div class="maint-row">
+                <span class="maint-k">Free RTOS Heap</span>
+                <span id="maint-heap" class="maint-v">184,320 bytes (simulated)</span>
+              </div>
+              <div class="maint-row">
+                <span class="maint-k">OTA Auth</span>
+                <span id="maint-ota-auth" class="maint-v">Preexisting limitation: unauthenticated endpoint</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- OTA Flash Slot -->
+          <div class="card maintenance-card">
+            <div class="maint-title">Over-the-Air Update (ElegantOTA)</div>
+            <div class="ota-box">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <span style="font-size: 0.8rem; font-weight: 600;">Direct OTA Endpoint:</span>
+                <span id="ota-badge" class="status-badge badge-active">Available at /update</span>
+              </div>
+              <p style="font-size: 0.78rem; color: var(--text-muted);">
+                Firmware binary updates can be flashed directly via the native ElegantOTA endpoint at <code>/update</code>. Note: Preexisting limitation: base firmware does not enforce authentication on this endpoint.
+              </p>
+              <div style="display: flex; gap: 8px;">
+                <a id="ota-open-btn" href="/update" target="_blank" class="btn-secondary" style="display: inline-flex; align-items: center; justify-content: center; text-decoration: none; font-size: 0.76rem; padding: 8px 14px;">Open ElegantOTA Portal &rarr;</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

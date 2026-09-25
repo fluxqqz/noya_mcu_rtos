@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NOYA — Control Panel Preview</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+
+    <!-- Demo Banner -->
+    <div class="demo-banner" role="status">
+      <span class="badge badge-demo">DEMO PREVIEW</span>
+      <span class="banner-text">No device connected — all telemetry, timing, and sequence actuation are simulated.</span>
+    </div>
+
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-brand">
+        <h1 class="brand-title">NOYA</h1>
+        <p class="brand-subtitle">Control Panel Preview</p>
+      </div>
+
+      <div class="header-actions">
+        <div class="mode-segmented" role="group" aria-label="Operating Mode">
+          <button type="button" id="btn-mode-manual" class="segmented-btn active" aria-pressed="true">Manual</button>
+          <button type="button" id="btn-mode-auto" class="segmented-btn" aria-pressed="false">Auto</button>
+        </div>
+        <button type="button" id="btn-pause-sim" class="btn-pause" aria-pressed="false">Pause Sim</button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-layout">
+
+      <!-- Status Bar -->
+      <section class="status-strip" aria-label="System status">
+        <div class="status-cell">
+          <span class="cell-label">Operating Mode</span>
+          <span id="stat-mode" class="cell-val">MANUAL</span>
+        </div>
+        <div class="status-cell">
+          <span class="cell-label">Simulation State</span>
+          <span id="stat-sim" class="cell-val text-teal">ACTIVE</span>
+        </div>
+        <div class="status-cell">
+          <span class="cell-label">Sequence Status</span>
+          <span id="stat-auto-due" class="cell-val text-muted">Standby (Manual)</span>
+        </div>
+      </section>
+
+      <!-- Servo Actuators -->
+      <section class="section-block" aria-labelledby="servos-title">
+        <h2 id="servos-title" class="section-heading">Servo Actuators</h2>
+        <div class="servos-grid">
+
+          <!-- Servo 1 Card -->
+          <article class="card servo-card" id="card-servo-1">
+            <div class="card-head">
+              <div class="title-with-pin">
+                <h3 class="servo-name">Servo 1</h3>
+                <span class="pin-tag">GPIO 5</span>
+              </div>
+              <span id="servo-1-status" class="status-pill pill-idle">IDLE</span>
+            </div>
+
+            <div class="angle-display">
+              <span class="angle-caption">Position</span>
+              <span id="servo-1-angle" class="angle-num">30°</span>
+            </div>
+
+            <div class="control-row">
+              <div class="label-row">
+                <label for="servo-1-slider">Command Angle</label>
+                <span id="servo-1-manual-badge" class="manual-only-tag">(Manual only)</span>
+              </div>
+              <div class="slider-control-group">
+                <input type="range" id="servo-1-slider" min="0" max="180" step="1" value="30">
+                <div class="numeric-input-wrap">
+                  <label for="servo-1-number" class="sr-only">Servo 1 Angle Input</label>
+                  <input type="number" id="servo-1-number" min="0" max="180" step="1" value="30" class="angle-input" aria-describedby="servo-1-error">
+                  <span class="unit-deg" aria-hidden="true">°</span>
+                </div>
+              </div>
+              <div id="servo-1-error" class="servo-error-msg" role="alert" aria-live="polite"></div>
+
+              <div class="preset-group">
+                <div class="preset-btn-row">
+                  <button type="button" id="servo-1-preset-1" class="btn btn-secondary btn-preset">Move to 30°</button>
+                  <button type="button" id="servo-1-preset-2" class="btn btn-secondary btn-preset">Move to 85°</button>
+                </div>
+                <details class="preset-details" id="servo-1-preset-details">
+                  <summary class="preset-summary">Edit presets</summary>
+                  <div class="preset-edit-row">
+                    <div class="preset-field">
+                      <label for="servo-1-preset-val-1" class="preset-label">Preset 1 (°)</label>
+                      <input type="number" id="servo-1-preset-val-1" min="0" max="180" step="1" value="30" class="angle-input preset-input" aria-describedby="servo-1-preset-1-error">
+                      <div id="servo-1-preset-1-error" class="servo-error-msg" role="alert" aria-live="polite"></div>
+                    </div>
+                    <div class="preset-field">
+                      <label for="servo-1-preset-val-2" class="preset-label">Preset 2 (°)</label>
+                      <input type="number" id="servo-1-preset-val-2" min="0" max="180" step="1" value="85" class="angle-input preset-input" aria-describedby="servo-1-preset-2-error">
+                      <div id="servo-1-preset-2-error" class="servo-error-msg" role="alert" aria-live="polite"></div>
+                    </div>
+                  </div>
+                </details>
+              </div>
+            </div>
+
+            <div class="card-foot">
+              <button type="button" id="servo-1-run" class="btn btn-secondary btn-run" aria-label="Start sequence for Servo 1">Start sequence</button>
+            </div>
+          </article>
+
+          <!-- Servo 2 Card -->
+          <article class="card servo-card" id="card-servo-2">
+            <div class="card-head">
+              <div class="title-with-pin">
+                <h3 class="servo-name">Servo 2</h3>
+                <span class="pin-tag">GPIO 1</span>
+              </div>
+              <span id="servo-2-status" class="status-pill pill-idle">IDLE</span>
+            </div>
+
+            <div class="angle-display">
+              <span class="angle-caption">Position</span>
+              <span id="servo-2-angle" class="angle-num">30°</span>
+            </div>
+
+            <div class="control-row">
+              <div class="label-row">
+                <label for="servo-2-slider">Command Angle</label>
+                <span id="servo-2-manual-badge" class="manual-only-tag">(Manual only)</span>
+              </div>
+              <div class="slider-control-group">
+                <input type="range" id="servo-2-slider" min="0" max="180" step="1" value="30">
+                <div class="numeric-input-wrap">
+                  <label for="servo-2-number" class="sr-only">Servo 2 Angle Input</label>
+                  <input type="number" id="servo-2-number" min="0" max="180" step="1" value="30" class="angle-input" aria-describedby="servo-2-error">
+                  <span class="unit-deg" aria-hidden="true">°</span>
+                </div>
+              </div>
+              <div id="servo-2-error" class="servo-error-msg" role="alert" aria-live="polite"></div>
+
+              <div class="preset-group">
+                <div class="preset-btn-row">
+                  <button type="button" id="servo-2-preset-1" class="btn btn-secondary btn-preset">Move to 30°</button>
+                  <button type="button" id="servo-2-preset-2" class="btn btn-secondary btn-preset">Move to 85°</button>
+                </div>
+                <details class="preset-details" id="servo-2-preset-details">
+                  <summary class="preset-summary">Edit presets</summary>
+                  <div class="preset-edit-row">
+                    <div class="preset-field">
+                      <label for="servo-2-preset-val-1" class="preset-label">Preset 1 (°)</label>
+                      <input type="number" id="servo-2-preset-val-1" min="0" max="180" step="1" value="30" class="angle-input preset-input" aria-describedby="servo-2-preset-1-error">
+                      <div id="servo-2-preset-1-error" class="servo-error-msg" role="alert" aria-live="polite"></div>
+                    </div>
+                    <div class="preset-field">
+                      <label for="servo-2-preset-val-2" class="preset-label">Preset 2 (°)</label>
+                      <input type="number" id="servo-2-preset-val-2" min="0" max="180" step="1" value="85" class="angle-input preset-input" aria-describedby="servo-2-preset-2-error">
+                      <div id="servo-2-preset-2-error" class="servo-error-msg" role="alert" aria-live="polite"></div>
+                    </div>
+                  </div>
+                </details>
+              </div>
+            </div>
+
+            <div class="card-foot">
+              <button type="button" id="servo-2-run" class="btn btn-secondary btn-run" aria-label="Start sequence for Servo 2">Start sequence</button>
+            </div>
+          </article>
+
+        </div>
+      </section>
+
+      <!-- Relay Bank -->
+      <section class="section-block" aria-labelledby="relays-title">
+        <h2 id="relays-title" class="section-heading">Relay Bank</h2>
+        <div class="relays-grid">
+
+          <!-- Relay 1 -->
+          <div class="card relay-card">
+            <div class="relay-meta">
+              <div class="title-with-pin">
+                <h3 class="relay-name">Relay 1</h3>
+                <span class="pin-tag">GPIO 4</span>
+              </div>
+              <span id="relay-1-text" class="relay-state">OFF</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="relay-1-toggle" role="switch" aria-checked="false">
+              <span class="toggle-track"></span>
+              <span class="sr-only">Toggle Relay 1</span>
+            </label>
+          </div>
+
+          <!-- Relay 2 -->
+          <div class="card relay-card">
+            <div class="relay-meta">
+              <div class="title-with-pin">
+                <h3 class="relay-name">Relay 2</h3>
+                <span class="pin-tag">GPIO 15</span>
+              </div>
+              <span id="relay-2-text" class="relay-state">OFF</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="relay-2-toggle" role="switch" aria-checked="false">
+              <span class="toggle-track"></span>
+              <span class="sr-only">Toggle Relay 2</span>
+            </label>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- Collapsible Settings & Device Info -->
+      <div class="details-stack">
+
+        <!-- Sequence Settings -->
+        <details class="details-panel" id="details-settings">
+          <summary class="details-summary">Sequence Settings (seqMove)</summary>
+          <div class="details-body">
+            <form id="settings-form" novalidate>
+              <div class="fields-grid">
+                <div class="field-item">
+                  <label for="cfg-open">Open Angle (°)</label>
+                  <input type="number" id="cfg-open" min="0" max="180" step="1" value="30" required>
+                  <span class="field-hint">Range 0–180°</span>
+                </div>
+                <div class="field-item">
+                  <label for="cfg-close">Close Angle (°)</label>
+                  <input type="number" id="cfg-close" min="0" max="180" step="1" value="85" required>
+                  <span class="field-hint">Range 0–180° (must differ)</span>
+                </div>
+                <div class="field-item">
+                  <label for="cfg-hold">Hold Delay (ms)</label>
+                  <input type="number" id="cfg-hold" min="50" max="5000" step="10" value="200" required>
+                  <span class="field-hint">50–5000 ms</span>
+                </div>
+              </div>
+
+              <div id="settings-feedback" class="feedback-msg" role="status" aria-live="polite"></div>
+
+              <div class="form-btn-row">
+                <button type="button" id="btn-reset-settings" class="btn btn-secondary">Reset Defaults</button>
+                <button type="submit" class="btn btn-primary">Save Settings</button>
+              </div>
+            </form>
+          </div>
+        </details>
+
+        <!-- Device Information -->
+        <details class="details-panel" id="details-device">
+          <summary class="details-summary">Device Information (Simulated)</summary>
+          <div class="details-body">
+            <div class="device-info-list">
+              <div class="info-row">
+                <span class="info-label">Target Hardware</span>
+                <span class="info-val">ESP32 RTOS (Simulated Preview)</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Firmware Target</span>
+                <span class="info-val">rtos_non_sensor.ino</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Connection Mode</span>
+                <span class="info-val">Offline preview (file:// protocol)</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Hardware Map</span>
+                <span class="info-val">Servos: GPIO 5, 1 &bull; Relays: GPIO 4, 15</span>
+              </div>
+            </div>
+
+            <div class="firmware-box">
+              <h4 class="firmware-title">Firmware Update</h4>
+              <p class="firmware-desc">Firmware updates are disabled in this standalone simulation preview. Physical OTA flashing is provided directly via the hardware device endpoint.</p>
+              <button type="button" class="btn btn-secondary" disabled aria-disabled="true">Firmware Update (Disabled in Demo)</button>
+            </div>
+          </div>
+        </details>
+
+      </div>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
