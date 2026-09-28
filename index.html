@@ -29,6 +29,9 @@
       </div>
 
       <div class="header-actions">
+        <a id="btn-visualizer-link" href="http://localhost:5174" target="_blank" rel="noopener noreferrer" class="btn-viz" title="Open 3D Kinematics Simulator">
+          <span class="viz-icon">&#x25C8;</span> 3D Visualizer
+        </a>
         <div class="mode-segmented" role="group" aria-label="Operating Mode">
           <button type="button" id="btn-mode-manual" class="segmented-btn active" aria-pressed="true">Manual</button>
           <button type="button" id="btn-mode-auto" class="segmented-btn" aria-pressed="false">Auto</button>
@@ -78,6 +81,7 @@
             <div class="angle-display">
               <span class="angle-caption">Commanded Position <span class="caption-hint">(not sensed)</span></span>
               <span id="servo-1-angle" class="angle-num">30°</span>
+              <span id="servo-1-pulse" class="pulse-caption">833 µs</span>
             </div>
 
             <div class="control-row">
@@ -140,6 +144,7 @@
             <div class="angle-display">
               <span class="angle-caption">Commanded Position <span class="caption-hint">(not sensed)</span></span>
               <span id="servo-2-angle" class="angle-num">30°</span>
+              <span id="servo-2-pulse" class="pulse-caption">833 µs</span>
             </div>
 
             <div class="control-row">
@@ -320,6 +325,14 @@
                 <span class="info-label">OTA Security</span>
                 <span id="info-ota-auth" class="info-val">Preexisting limitation: unauthenticated endpoint</span>
               </div>
+            </div>
+
+            <div class="firmware-box" style="margin-bottom: 1.25rem;">
+              <h4 class="firmware-title">3D Kinematics Visualizer</h4>
+              <p class="firmware-desc">
+                Interactive real-time 3D WebGL plant visualization driven by the exact FreeRTOS 5ms discrete IIR easing loop.
+              </p>
+              <a id="visualizer-device-link" href="http://localhost:5174" target="_blank" rel="noopener noreferrer" class="btn btn-secondary">Open 3D Visualizer &rarr;</a>
             </div>
 
             <div class="caveat-box">

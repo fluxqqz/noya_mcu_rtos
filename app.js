@@ -173,6 +173,7 @@ function applyStatusToState(state, data) {
         // Conservative mapping: explicitly require true, otherwise treat as detached
         state.servos[s.id].attached = s.attached === true;
         state.servos[s.id].angle = Number.isFinite(s.angle) ? s.angle : (Number(s.angle) || 0);
+        state.servos[s.id].pulse_us = Number.isFinite(s.pulse_us) ? s.pulse_us : (Number(s.pulse_us) || 0);
         state.servos[s.id].running = Boolean(s.running);
         state.servos[s.id].phase = s.phase || 'idle';
         state.servos[s.id].statusText = s.status || '';
@@ -388,6 +389,8 @@ if (typeof window !== 'undefined') {
       appAlertDismiss: document.getElementById('app-alert-dismiss'),
       demoBanner: document.getElementById('demo-banner'),
 
+      btnVisualizerLink: document.getElementById('btn-visualizer-link'),
+      visualizerDeviceLink: document.getElementById('visualizer-device-link'),
       btnModeManual: document.getElementById('btn-mode-manual'),
       btnModeAuto: document.getElementById('btn-mode-auto'),
       btnPauseSim: document.getElementById('btn-pause-sim'),
@@ -396,6 +399,7 @@ if (typeof window !== 'undefined') {
       statAutoDue: document.getElementById('stat-auto-due'),
 
       servo1Angle: document.getElementById('servo-1-angle'),
+      servo1Pulse: document.getElementById('servo-1-pulse'),
       servo1Slider: document.getElementById('servo-1-slider'),
       servo1Number: document.getElementById('servo-1-number'),
       servo1Preset1Btn: document.getElementById('servo-1-preset-1'),
@@ -412,6 +416,7 @@ if (typeof window !== 'undefined') {
       servo1ManualBadge: document.getElementById('servo-1-manual-badge'),
 
       servo2Angle: document.getElementById('servo-2-angle'),
+      servo2Pulse: document.getElementById('servo-2-pulse'),
       servo2Slider: document.getElementById('servo-2-slider'),
       servo2Number: document.getElementById('servo-2-number'),
       servo2Preset1Btn: document.getElementById('servo-2-preset-1'),
@@ -474,6 +479,11 @@ if (typeof window !== 'undefined') {
       dom.appAlertDismiss.addEventListener('click', clearError);
     }
 
+    // Configure 3D Visualizer links with MCU origin
+    const mcuOrigin = window.location.protocol.startsWith('http') ? encodeURIComponent(window.location.origin) : 'http%3A%2F%2F192.168.10.1';
+    if (dom.btnVisualizerLink) dom.btnVisualizerLink.href = `http://localhost:5174/?mcu=${mcuOrigin}`;
+    if (dom.visualizerDeviceLink) dom.visualizerDeviceLink.href = `http://localhost:5174/?mcu=${mcuOrigin}`;
+
     // ── UI Rendering Helpers ──
 
     function formatUptime(seconds) {
@@ -499,6 +509,10 @@ if (typeof window !== 'undefined') {
       const totalCycles = state.config.cyclesPerSession || 5;
 
       angleElem.textContent = `${s.angle}°`;
+
+      const pulseElem = isS1 ? dom.servo1Pulse : dom.servo2Pulse;
+      const pulseUs = s.pulse_us || Math.round(500 + (s.angle / 180) * 2000);
+      if (pulseElem) pulseElem.textContent = `${pulseUs} µs`;
 
       // Avoid overwriting focused or actively edited angle inputs
       if (document.activeElement !== sliderElem) {
@@ -1809,6 +1823,7 @@ async function runSelfTest() {
         'app-alert-text',
         'app-alert-dismiss',
         'demo-banner',
+        'btn-visualizer-link',
         'btn-mode-manual',
         'btn-mode-auto',
         'btn-pause-sim',
@@ -1819,6 +1834,7 @@ async function runSelfTest() {
         'servo-1-status',
         'servo-1-cycle',
         'servo-1-angle',
+        'servo-1-pulse',
         'servo-1-slider',
         'servo-1-manual-badge',
         'servo-1-number',
@@ -1836,6 +1852,7 @@ async function runSelfTest() {
         'servo-2-status',
         'servo-2-cycle',
         'servo-2-angle',
+        'servo-2-pulse',
         'servo-2-slider',
         'servo-2-manual-badge',
         'servo-2-number',
@@ -1872,6 +1889,7 @@ async function runSelfTest() {
         'info-ap',
         'info-mdns',
         'info-ota-auth',
+        'visualizer-device-link',
         'ota-link',
       ];
 

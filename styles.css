@@ -455,6 +455,41 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.pulse-caption {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--navy-500);
+  margin-top: 0.15rem;
+  letter-spacing: 0.03em;
+}
+
+.btn-viz {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  padding: 0.45rem 0.85rem;
+  border-radius: var(--radius-md);
+  color: var(--navy-700);
+  background-color: #fff;
+  border: 1px solid var(--border-color);
+  transition: all 0.15s ease;
+}
+
+.btn-viz:hover {
+  background-color: var(--navy-50);
+  color: var(--navy-900);
+  border-color: var(--navy-300);
+}
+
+.viz-icon {
+  font-size: 0.95rem;
+  color: #10b981;
+}
+
 /* Control Row & Slider Controls */
 .control-row {
   display: flex;

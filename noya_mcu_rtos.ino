@@ -53,11 +53,21 @@ enum ServoCmdType {
   CMD_SET_ANGLE
 };
 
+enum class MotionProfile {
+  Exponential,
+  SCurve
+};
+
 struct ServoCommand {
   ServoCmdType type;
   int angle;
   uint32_t epoch;
 };
+
+// Forward declaration with defaults for moveServo
+void moveServo(int setpoint_deg, Servo& servo, int servoIndex, uint32_t token,
+               MotionProfile profile = MotionProfile::Exponential,
+               uint32_t durationMs = 1000);
 
 static QueueHandle_t servoQueue1 = NULL;
 static QueueHandle_t servoQueue2 = NULL;
@@ -71,6 +81,9 @@ static int seq_close_deg = 85;
 static int seq_hold_ms = 200;
 static int seq_cycles_per_session = 5;
 static int seq_rest_ms = 10000;
+// ponytail: default motion profile for moveServo; change to MotionProfile::SCurve for smooth ease-in/ease-out
+static MotionProfile seq_motion_profile = MotionProfile::Exponential;
+static uint32_t seq_move_duration_ms = 1000;
 
 static int commanded_angles[NUM_SERVOS] = { START_DEG, START_DEG, START_DEG, START_DEG, START_DEG };
 static char servo_status_str[NUM_SERVOS][16] = { "IDLE", "IDLE", "PARKED", "PARKED", "PARKED" };
@@ -259,7 +272,9 @@ void wifiTask(void* pvParameters) {
 }
 
 // ─── SERVO ACTUATION (OWNED BY WORKER TASKS ONLY) ─────────────────────────────
-void moveServo(int setpoint_deg, Servo& servo, int servoIndex, uint32_t token) {
+void moveServo(int setpoint_deg, Servo& servo, int servoIndex, uint32_t token,
+               MotionProfile profile,
+               uint32_t durationMs) {
   setpoint_deg = constrain(setpoint_deg, MIN_SERVO, MAX_SERVO);
   int setpoint_us =
     map(setpoint_deg, MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
@@ -277,23 +292,47 @@ void moveServo(int setpoint_deg, Servo& servo, int servoIndex, uint32_t token) {
   }
   xSemaphoreGive(stateMutex);
 
-  float prevmove = move;
-  const float alpha = 0.01;
+  if (profile == MotionProfile::SCurve) {
+    float start_us = move;
+    uint32_t startTime = millis();
+    // ponytail: quintic smoothstep (Ken Perlin) S-curve; durationMs=0 or already-at-target skips
+    while (durationMs > 0 && abs(setpoint_us - (int)start_us) > 1) {
+      uint32_t elapsed = millis() - startTime;
+      if (elapsed >= durationMs) break;
+      float t = (float)elapsed / (float)durationMs;
+      float blend = t * t * t * (10.0f + t * (-15.0f + 6.0f * t));
+      int pulse = (int)(start_us + (setpoint_us - start_us) * blend);
 
-  while (abs(setpoint_us - (int)move) > 1) {
-    move = (setpoint_us * alpha) + (prevmove * (1.0 - alpha));
-    prevmove = move;
-
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
-    if (isPaused || servoEpoch[servoIndex] != token || !servo_attached[servoIndex]) {
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      if (isPaused || servoEpoch[servoIndex] != token || !servo_attached[servoIndex]) {
+        xSemaphoreGive(stateMutex);
+        return;
+      }
+      servo.writeMicroseconds(pulse);
+      last_actual_pulse_us[servoIndex] = pulse;
       xSemaphoreGive(stateMutex);
-      return;
-    }
-    servo.writeMicroseconds((int)move);
-    last_actual_pulse_us[servoIndex] = (int)move;
-    xSemaphoreGive(stateMutex);
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  } else {
+    float prevmove = move;
+    const float alpha = 0.01;
+
+    while (abs(setpoint_us - (int)move) > 1) {
+      move = (setpoint_us * alpha) + (prevmove * (1.0 - alpha));
+      prevmove = move;
+
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      if (isPaused || servoEpoch[servoIndex] != token || !servo_attached[servoIndex]) {
+        xSemaphoreGive(stateMutex);
+        return;
+      }
+      servo.writeMicroseconds((int)move);
+      last_actual_pulse_us[servoIndex] = (int)move;
+      xSemaphoreGive(stateMutex);
+
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
   }
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -369,7 +408,7 @@ void servoWorkerTask(void* pvParameters) {
     xSemaphoreGive(stateMutex);
 
     if (hasCmd) {
-      moveServo(cmd.angle, s, idx, token);
+      moveServo(cmd.angle, s, idx, token, seq_motion_profile, seq_move_duration_ms);
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       if (servoEpoch[idx] == token && !isPaused && !servo_running[idx]) {
         if (servo_attached[idx]) {
@@ -387,6 +426,8 @@ void servoWorkerTask(void* pvParameters) {
     bool run = false;
     int openDeg = 30, closeDeg = 85, holdMs = 200;
     int cyclesPerSession = 5, restMs = 10000;
+    MotionProfile profile = MotionProfile::Exponential;
+    uint32_t durationMs = 1000;
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     if (!isPaused && servo_running[idx] && servo_attached[idx]) {
@@ -397,6 +438,8 @@ void servoWorkerTask(void* pvParameters) {
       holdMs = seq_hold_ms;
       cyclesPerSession = seq_cycles_per_session;
       restMs = seq_rest_ms;
+      profile = seq_motion_profile;
+      durationMs = seq_move_duration_ms;
       if (currentToken != token) {
         currentToken = token;
         currentCycle = 1;
@@ -423,7 +466,7 @@ void servoWorkerTask(void* pvParameters) {
       }
       xSemaphoreGive(stateMutex);
 
-      moveServo(openDeg, s, idx, token);
+      moveServo(openDeg, s, idx, token, profile, durationMs);
       if (!waitEpochDelay(idx, token, holdMs)) {
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
@@ -442,7 +485,7 @@ void servoWorkerTask(void* pvParameters) {
       }
       xSemaphoreGive(stateMutex);
 
-      moveServo(closeDeg, s, idx, token);
+      moveServo(closeDeg, s, idx, token, profile, durationMs);
       if (!waitEpochDelay(idx, token, holdMs)) {
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
@@ -520,8 +563,20 @@ void sensorServo(void* pvParameters) {
 
 // ─── HTTP API & WEB SERVER ───────────────────────────────────────────────────
 
-// Cross-origin mutation protection: require custom header and emit no CORS headers
+// ponytail: CORS headers and OPTIONS preflight allow browser visualizer to query MCU directly
+void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With");
+}
+
+// Cross-origin mutation protection: require custom header and emit CORS headers
 bool checkMutationAuth() {
+  sendCorsHeaders();
+  if (server.method() == HTTP_OPTIONS) {
+    server.send(204);
+    return false;
+  }
   if (!server.hasHeader("X-Requested-With")) {
     server.send(403, "application/json", "{\"error\":\"Forbidden: Missing X-Requested-With header\"}");
     return false;
@@ -530,10 +585,17 @@ bool checkMutationAuth() {
 }
 
 void handleApiStatus() {
+  sendCorsHeaders();
+  if (server.method() == HTTP_OPTIONS) {
+    server.send(204);
+    return;
+  }
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   bool curAuto = isAutoMode;
   bool curPause = isPaused;
   int angles[NUM_SERVOS];
+  int pulses[NUM_SERVOS];
   char statuses[NUM_SERVOS][16];
   char phases[NUM_SERVOS][16];
   bool running[NUM_SERVOS];
@@ -544,6 +606,7 @@ void handleApiStatus() {
 
   for (int i = 0; i < NUM_SERVOS; i++) {
     angles[i] = commanded_angles[i];
+    pulses[i] = last_actual_pulse_us[i];
     strncpy(statuses[i], servo_status_str[i], sizeof(statuses[i]) - 1);
     statuses[i][sizeof(statuses[i]) - 1] = '\0';
     strncpy(phases[i], servo_phase_str[i], sizeof(phases[i]) - 1);
@@ -586,11 +649,11 @@ void handleApiStatus() {
            "\"mdns\":\"%s\","
            "\"ota_auth\":\"none (preexisting limitation)\","
            "\"servos\":["
-           "{\"id\":1,\"pin\":%d,\"name\":\"Servo 1\",\"angle\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
-           "{\"id\":2,\"pin\":%d,\"name\":\"Servo 2\",\"angle\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
-           "{\"id\":3,\"pin\":%d,\"name\":\"Servo 3\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
-           "{\"id\":4,\"pin\":%d,\"name\":\"Servo 4\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
-           "{\"id\":5,\"pin\":%d,\"name\":\"Servo 5\",\"angle\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s}"
+           "{\"id\":1,\"pin\":%d,\"name\":\"Servo 1\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
+           "{\"id\":2,\"pin\":%d,\"name\":\"Servo 2\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
+           "{\"id\":3,\"pin\":%d,\"name\":\"Servo 3\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
+           "{\"id\":4,\"pin\":%d,\"name\":\"Servo 4\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
+           "{\"id\":5,\"pin\":%d,\"name\":\"Servo 5\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s}"
            "],"
            "\"relays\":["
            "{\"id\":1,\"pin\":%d,\"state\":%d},"
@@ -607,11 +670,11 @@ void handleApiStatus() {
            staIp.c_str(),
            apIp.c_str(),
            MDNS_HOST,
-           SERVO_PINS[0], angles[0], statuses[0], running[0] ? "true" : "false", phases[0], cycles[0], restRemaining[0], attached[0] ? "true" : "false",
-           SERVO_PINS[1], angles[1], statuses[1], running[1] ? "true" : "false", phases[1], cycles[1], restRemaining[1], attached[1] ? "true" : "false",
-           SERVO_PINS[2], angles[2], statuses[2], attached[2] ? "true" : "false",
-           SERVO_PINS[3], angles[3], statuses[3], attached[3] ? "true" : "false",
-           SERVO_PINS[4], angles[4], statuses[4], attached[4] ? "true" : "false",
+           SERVO_PINS[0], angles[0], pulses[0], statuses[0], running[0] ? "true" : "false", phases[0], cycles[0], restRemaining[0], attached[0] ? "true" : "false",
+           SERVO_PINS[1], angles[1], pulses[1], statuses[1], running[1] ? "true" : "false", phases[1], cycles[1], restRemaining[1], attached[1] ? "true" : "false",
+           SERVO_PINS[2], angles[2], pulses[2], statuses[2], attached[2] ? "true" : "false",
+           SERVO_PINS[3], angles[3], pulses[3], statuses[3], attached[3] ? "true" : "false",
+           SERVO_PINS[4], angles[4], pulses[4], statuses[4], attached[4] ? "true" : "false",
            RELAY_1, r1 ? 1 : 0,
            RELAY_2, r2 ? 1 : 0,
            sOpen, sClose, sHold, sCycles, sRest);
@@ -1055,6 +1118,11 @@ void initWebServer() {
   server.on("/api/sequence/reset", HTTP_POST, handleApiSequenceReset);
 
   server.onNotFound([]() {
+    if (server.method() == HTTP_OPTIONS) {
+      sendCorsHeaders();
+      server.send(204);
+      return;
+    }
     server.send(404, "text/plain", "404: Not Found");
   });
 }
@@ -1098,10 +1166,12 @@ void setup() {
   initOTA();
   delay(500);
 
+  Serial.println("A"); Serial.flush();
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
+  Serial.println("B"); Serial.flush();
 
   for (int i = 0; i < NUM_SERVOS; i++) {
     servos[i].setPeriodHertz(50);
@@ -1120,7 +1190,7 @@ void setup() {
   digitalWrite(RELAY_1, LOW);
   digitalWrite(RELAY_2, LOW);
 
-  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 8192, NULL, 1, NULL, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 12288, NULL, 1, NULL, 0) != pdPASS) {
     Serial.println("[WiFi] ERROR: Could not create WiFi task; STA unavailable. AP remains enabled.");
   }
 
