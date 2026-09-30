@@ -46,7 +46,7 @@ const int MIN_SERVO = 0;
 const int MAX_SERVO_US = 2500;
 const int MIN_SERVO_US = 500;
 
-const int START_DEG = 30;
+const int START_DEG = 50;
 
 // ─── RTOS TASK QUEUES & SYNCHRONIZATION ───────────────────────────────────────
 enum ServoCmdType {
@@ -83,7 +83,7 @@ static int seq_cycles_per_session = 5;
 static int seq_rest_ms = 10000;
 // ponytail: default motion profile for moveServo; change to MotionProfile::SCurve for smooth ease-in/ease-out
 static MotionProfile seq_motion_profile = MotionProfile::Exponential;
-static uint32_t seq_move_duration_ms = 1000;
+static uint32_t seq_move_duration_ms = 3000;
 
 static int commanded_angles[NUM_SERVOS] = { START_DEG, START_DEG, START_DEG, START_DEG, START_DEG };
 static char servo_status_str[NUM_SERVOS][16] = { "IDLE", "IDLE", "PARKED", "PARKED", "PARKED" };
@@ -1190,7 +1190,7 @@ void setup() {
   digitalWrite(RELAY_1, LOW);
   digitalWrite(RELAY_2, LOW);
 
-  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 12288, NULL, 1, NULL, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 16384, NULL, 1, NULL, 0) != pdPASS) {
     Serial.println("[WiFi] ERROR: Could not create WiFi task; STA unavailable. AP remains enabled.");
   }
 
