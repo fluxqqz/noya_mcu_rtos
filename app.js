@@ -82,6 +82,43 @@ function validateSettings(cfg) {
 }
 
 /**
+ * Checks if any sequence mutation (RAM apply, RAM reset, or flash save) is currently in-flight.
+ */
+function isSequenceActionBusy(pendingSet) {
+  if (!pendingSet) return false;
+  return pendingSet.has('sequence') || pendingSet.has('sequence_reset') || pendingSet.has('sequence_save');
+}
+
+/**
+ * Validates eligibility for persisting active sequence to device flash.
+ * Blocks save if disconnected, cross-action busy, unapplied form edits (sequenceDirty),
+ * or running in offline file:// simulation (which has no flash storage).
+ */
+function getSequenceSaveStatus(state, pendingSet, isFilePreview) {
+  if (!state || !state.connected) {
+    return { allowed: false, reason: 'disconnected', error: 'Device disconnected' };
+  }
+  if (isSequenceActionBusy(pendingSet)) {
+    return { allowed: false, reason: 'busy', error: 'Sequence operation in progress' };
+  }
+  if (state.sequenceDirty) {
+    return {
+      allowed: false,
+      reason: 'dirty',
+      error: 'Unapplied form edits. Please click Apply first before saving to device.',
+    };
+  }
+  if (isFilePreview) {
+    return {
+      allowed: false,
+      reason: 'preview',
+      error: 'Save to device unavailable: offline file preview does not have flash storage.',
+    };
+  }
+  return { allowed: true, reason: 'ok', error: null };
+}
+
+/**
  * Validates manual servo angle command.
  * Requirements: integer in range 0..180.
  * Rejects blank, non-integer, decimals, scientific notation, and out-of-range values.
@@ -381,6 +418,9 @@ if (typeof window !== 'undefined') {
     function isPending(actionKey) {
       return pendingActions.has(actionKey);
     }
+    function isSettingsBusy() {
+      return isPending('sequence') || isPending('sequence_reset') || isPending('sequence_save');
+    }
 
     // DOM Elements Cache
     const dom = {
@@ -446,6 +486,7 @@ if (typeof window !== 'undefined') {
       settingsFeedback: document.getElementById('settings-feedback'),
       btnResetSettings: document.getElementById('btn-reset-settings'),
       btnSaveSettings: document.getElementById('btn-save-settings'),
+      btnSaveDevice: document.getElementById('btn-save-device'),
 
       infoChip: document.getElementById('info-chip'),
       infoFw: document.getElementById('info-fw'),
@@ -636,7 +677,7 @@ if (typeof window !== 'undefined') {
       dom.relay2Toggle.disabled = r2Locked;
 
       // Settings form
-      const settingsLocked = !isConnected || isPending('sequence') || isPending('sequence_reset');
+      const settingsLocked = !isConnected || isSettingsBusy();
       dom.cfgOpen.disabled = settingsLocked;
       dom.cfgClose.disabled = settingsLocked;
       dom.cfgHold.disabled = settingsLocked;
@@ -644,6 +685,12 @@ if (typeof window !== 'undefined') {
       if (dom.cfgRest) dom.cfgRest.disabled = settingsLocked;
       dom.btnResetSettings.disabled = settingsLocked;
       if (dom.btnSaveSettings) dom.btnSaveSettings.disabled = settingsLocked;
+      if (dom.btnSaveDevice) {
+        dom.btnSaveDevice.disabled = settingsLocked || isFilePreview;
+        if (isFilePreview) {
+          dom.btnSaveDevice.title = 'Save to device is disabled in offline file preview (no hardware flash storage)';
+        }
+      }
     }
 
     function updateStatusBar() {
@@ -1181,10 +1228,10 @@ if (typeof window !== 'undefined') {
       if (el) el.addEventListener('input', () => { state.sequenceDirty = true; });
     });
 
-    // Sequence Settings Form Submit
+    // Sequence Settings Form Submit (RAM Apply)
     dom.settingsForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      if (!state.connected || isPending('sequence')) return;
+      if (!state.connected || isSettingsBusy()) return;
 
       const candidate = {
         openAngle: dom.cfgOpen.value.trim(),
@@ -1228,16 +1275,16 @@ if (typeof window !== 'undefined') {
         state.config = result.values;
         state.sequenceDirty = false;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Sequence parameters saved on device. Active loops restarted.';
+        dom.settingsFeedback.textContent = 'Sequence parameters applied in RAM. Active loops restarted.';
       } else {
         dom.settingsFeedback.className = 'feedback-msg feedback-error';
         dom.settingsFeedback.textContent = res.error || 'Failed to apply sequence parameters.';
       }
     });
 
-    // Sequence Settings Reset Defaults
+    // Sequence Settings Reset Defaults (RAM)
     dom.btnResetSettings.addEventListener('click', async () => {
-      if (!state.connected || isPending('sequence_reset')) return;
+      if (!state.connected || isSettingsBusy()) return;
 
       if (isFilePreview) {
         state.config = { ...DEFAULT_CONFIG };
@@ -1248,7 +1295,7 @@ if (typeof window !== 'undefined') {
         if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
         if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Factory defaults restored (30°/85°, 200ms, 5 cycles, 10s rest).';
+        dom.settingsFeedback.textContent = 'Factory defaults restored in simulation.';
         [1, 2].forEach((id) => {
           if (state.servos[id].running && !state.paused) {
             startServoSim(id);
@@ -1269,12 +1316,37 @@ if (typeof window !== 'undefined') {
         if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
         if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Factory defaults restored on device (30°/85°, 200ms, 5 cycles, 10s rest).';
+        dom.settingsFeedback.textContent = 'Factory defaults restored in RAM. Click Save to Device to persist.';
       } else {
         dom.settingsFeedback.className = 'feedback-msg feedback-error';
         dom.settingsFeedback.textContent = res.error || 'Failed to reset sequence defaults.';
       }
     });
+
+    // Sequence Settings Save to Device (Flash)
+    if (dom.btnSaveDevice) {
+      dom.btnSaveDevice.addEventListener('click', async () => {
+        const status = getSequenceSaveStatus(state, pendingActions, isFilePreview);
+        if (!status.allowed) {
+          if (status.error && (status.reason === 'dirty' || status.reason === 'preview')) {
+            dom.settingsFeedback.className = 'feedback-msg feedback-error';
+            dom.settingsFeedback.textContent = status.error;
+          }
+          return;
+        }
+
+        const res = await executeApiPost('/api/sequence/save', {}, 'sequence_save');
+        if (res.ok) {
+          dom.settingsFeedback.className = 'feedback-msg feedback-success';
+          dom.settingsFeedback.textContent = res.data && res.data.message === 'Unchanged'
+            ? 'Sequence parameters already match device storage.'
+            : 'Active sequence saved to device flash.';
+        } else {
+          dom.settingsFeedback.className = 'feedback-msg feedback-error';
+          dom.settingsFeedback.textContent = res.error || 'Failed to save sequence to device.';
+        }
+      });
+    }
 
     // ── Application Initialization ──
 
@@ -1408,6 +1480,7 @@ async function runSelfTest() {
     { name: 'relay', url: '/api/relay', params: { id: 1, state: 1 }, expected: 'id=1&state=1' },
     { name: 'sequence', url: '/api/sequence', params: { open_deg: 30, close_deg: 85, hold_ms: 200, cycles_per_session: 5, rest_ms: 10000 }, expected: 'open_deg=30&close_deg=85&hold_ms=200&cycles_per_session=5&rest_ms=10000' },
     { name: 'sequence_reset', url: '/api/sequence/reset', params: {}, expected: '' },
+    { name: 'sequence_save', url: '/api/sequence/save', params: {}, expected: '' },
   ];
 
   apiMap.forEach((entry) => {
@@ -1655,7 +1728,117 @@ async function runSelfTest() {
   assert(inFlightPendingSeen === true, 'pending entry active during in-flight fetch');
   assert(mockPendingSet.size === 0, 'pending entry cleared after post completes');
 
-  // 11. Fake Timer for Simulation Runner Test
+  // 11. Sequence Flash Persistence (Save to Device) Flow, Errors, Locking & Simulation
+  const seqSavePendingSet = new Set();
+  let capturedSaveRequest = null;
+  const mockSaveFetchSuccess = async (url, opts) => {
+    capturedSaveRequest = { url, method: opts.method, body: opts.body, headers: opts.headers };
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, saved: true }),
+    };
+  };
+
+  const saveSuccessRes = await postApiCommand('/api/sequence/save', {}, 'sequence_save', seqSavePendingSet, mockSaveFetchSuccess);
+  assert(saveSuccessRes.ok === true, 'Save to device returns ok on 200');
+  assert(capturedSaveRequest.url === '/api/sequence/save', 'Save endpoint must be /api/sequence/save');
+  assert(capturedSaveRequest.method === 'POST', 'Save method must be POST');
+  assert(capturedSaveRequest.body === '', 'Save payload must be empty (active config only, no implicit apply)');
+  assert(capturedSaveRequest.headers['X-Requested-With'] === 'XMLHttpRequest', 'Save request requires mutation header');
+
+  // Skip unchanged writes: 200 with unchanged message
+  const mockSaveFetchUnchanged = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, saved: false, message: 'Unchanged' }),
+  });
+  const saveUnchangedRes = await postApiCommand('/api/sequence/save', {}, 'sequence_save', seqSavePendingSet, mockSaveFetchUnchanged);
+  assert(saveUnchangedRes.ok === true && saveUnchangedRes.data.message === 'Unchanged', 'Save response preserves unchanged status');
+
+  // Failure handling: server error HTTP 500
+  const mockSaveFetchFail = async () => ({
+    ok: false,
+    status: 500,
+    json: async () => ({ error: 'Failed to write storage' }),
+  });
+  const saveFailRes = await postApiCommand('/api/sequence/save', {}, 'sequence_save', seqSavePendingSet, mockSaveFetchFail);
+  assert(saveFailRes.ok === false, 'Save to device fails on HTTP 500');
+  assert(saveFailRes.error === 'Failed to write storage', 'Save to device propagates server error message');
+
+  // Failure handling: invalid active config HTTP 400
+  const mockSaveFetchInvalid = async () => ({
+    ok: false,
+    status: 400,
+    json: async () => ({ error: 'Active sequence parameters are invalid' }),
+  });
+  const saveInvalidRes = await postApiCommand('/api/sequence/save', {}, 'sequence_save', seqSavePendingSet, mockSaveFetchInvalid);
+  assert(saveInvalidRes.ok === false, 'Save to device reports invalid active parameters');
+  assert(saveInvalidRes.error === 'Active sequence parameters are invalid', 'Active sequence validation error matches');
+
+  // Failure handling: network failure
+  const mockSaveFetchThrow = async () => { throw new Error('Network offline'); };
+  const saveNetworkFailRes = await postApiCommand('/api/sequence/save', {}, 'sequence_save', seqSavePendingSet, mockSaveFetchThrow);
+  assert(saveNetworkFailRes.ok === false && saveNetworkFailRes.error === 'Network offline', 'Network failure handled truthy');
+
+  // Cross-action busy tracking (actual production helper isSequenceActionBusy)
+  const testBusySet = new Set();
+  assert(isSequenceActionBusy(testBusySet) === false, 'Not busy when no sequence action in flight');
+  testBusySet.add('sequence_save');
+  assert(isSequenceActionBusy(testBusySet) === true, 'Busy when sequence_save in flight');
+  const dupSaveRes = await postApiCommand('/api/sequence/save', {}, 'sequence_save', testBusySet, mockSaveFetchSuccess);
+  assert(dupSaveRes.ok === false && dupSaveRes.duplicate === true, 'Duplicate save request rejected while already pending');
+  testBusySet.delete('sequence_save');
+
+  testBusySet.add('sequence');
+  assert(isSequenceActionBusy(testBusySet) === true, 'Apply (sequence) locks sequence actions');
+  testBusySet.delete('sequence');
+
+  testBusySet.add('sequence_reset');
+  assert(isSequenceActionBusy(testBusySet) === true, 'Reset (sequence_reset) locks sequence actions');
+  testBusySet.delete('sequence_reset');
+
+  // Eligibility evaluation (actual production helper getSequenceSaveStatus)
+  const testState = createAppState({ connected: true, sequenceDirty: false });
+  assert(getSequenceSaveStatus(testState, testBusySet, false).allowed === true, 'Save allowed when connected, clean form, live MCU, not busy');
+
+  // Offline simulation (file://): save rejected without claiming real flash storage
+  const previewRes = getSequenceSaveStatus(testState, testBusySet, true);
+  assert(previewRes.allowed === false && previewRes.reason === 'preview', 'Save blocked in file preview (cannot claim real flash storage)');
+  assert(previewRes.error.includes('flash storage'), 'Preview error message truthfully notes absence of hardware flash storage');
+
+  // Disconnected state
+  const disconnState = createAppState({ connected: false });
+  assert(getSequenceSaveStatus(disconnState, testBusySet, false).allowed === false, 'Save blocked when device disconnected');
+
+  // Cross-action busy states block save via production helper
+  testBusySet.add('sequence');
+  assert(getSequenceSaveStatus(testState, testBusySet, false).allowed === false, 'Save blocked while Apply in flight');
+  testBusySet.delete('sequence');
+
+  testBusySet.add('sequence_reset');
+  assert(getSequenceSaveStatus(testState, testBusySet, false).allowed === false, 'Save blocked while Reset in flight');
+  testBusySet.delete('sequence_reset');
+
+  testBusySet.add('sequence_save');
+  assert(getSequenceSaveStatus(testState, testBusySet, false).allowed === false, 'Save blocked while Save in flight');
+  testBusySet.delete('sequence_save');
+
+  // Unapplied form edits (sequenceDirty === true) block save and instruct user to Apply first
+  testState.sequenceDirty = true;
+  const dirtyRes = getSequenceSaveStatus(testState, testBusySet, false);
+  assert(dirtyRes.allowed === false && dirtyRes.reason === 'dirty', 'Save blocked when unapplied form edits exist (sequenceDirty === true)');
+  assert(dirtyRes.error.includes('Apply first'), 'Dirty error message instructs user to apply first');
+
+  // Once form is applied, sequenceDirty is cleared and save is immediately allowed
+  testState.sequenceDirty = false;
+  assert(getSequenceSaveStatus(testState, testBusySet, false).allowed === true, 'Save permitted once form edits applied');
+
+  // Restoring defaults clears sequenceDirty in RAM; stays RAM until saved
+  testState.sequenceDirty = false;
+  assert(getSequenceSaveStatus(testState, testBusySet, false).allowed === true, 'Reset defaults stays RAM and is immediately eligible for Save to Device');
+
+  // 12. Fake Timer for Simulation Runner Test
   function createFakeTimer() {
     let now = 0;
     let nextId = 1;
@@ -1879,6 +2062,8 @@ async function runSelfTest() {
         'cfg-rest',
         'settings-feedback',
         'btn-reset-settings',
+        'btn-save-settings',
+        'btn-save-device',
         'details-device',
         'info-chip',
         'info-fw',
@@ -1896,6 +2081,9 @@ async function runSelfTest() {
       for (const id of requiredDomIds) {
         assert(html.includes(`id="${id}"`), `DOM element #${id} must exist in index.html`);
       }
+      assert(html.includes('>Apply<'), 'Button label Apply must exist for RAM apply in index.html');
+      assert(html.includes('>Save to Device<'), 'Button label Save to Device must exist in index.html');
+      assert(html.includes('RAM vs Flash'), 'RAM vs Flash explanation note must exist in index.html');
       assert(!html.includes('id="cfg-interval"'), 'cfg-interval must not exist in index.html');
       assert(!html.includes('Auto Repeat Interval'), 'Auto Repeat Interval label must not exist in index.html');
       assert(html.includes('href="/update"'), 'Working /update link must exist in index.html');
@@ -1917,6 +2105,8 @@ if (typeof module !== 'undefined' && module.exports) {
     serializeFormUrlEncoded,
     createAppState,
     applyStatusToState,
+    isSequenceActionBusy,
+    getSequenceSaveStatus,
     postApiCommand,
     fetchStatus,
     startServoRunner,

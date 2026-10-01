@@ -941,11 +941,18 @@ input[type="range"]::-moz-range-thumb {
   color: var(--red-600);
 }
 
+.settings-persist-hint {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+  line-height: 1.4;
+}
+
 .form-btn-row {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
 /* Device Info List */

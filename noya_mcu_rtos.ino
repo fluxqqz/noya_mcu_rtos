@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <ElegantOTA.h>
+#include <Preferences.h>
 #include "dashboard_assets.h"
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -76,14 +77,78 @@ static SemaphoreHandle_t stateMutex = NULL;
 // Synchronized state shared between HTTP server and worker tasks
 static bool isAutoMode = false;
 static bool isPaused = false;
-static int seq_open_deg = 30;
-static int seq_close_deg = 85;
-static int seq_hold_ms = 200;
-static int seq_cycles_per_session = 5;
-static int seq_rest_ms = 10000;
+
+// ─── SEQUENCE CONFIGURATION & FLASH PERSISTENCE ──────────────────────────────
+// ponytail: atomic single Preferences blob for non-volatile sequence config
+static const uint32_t SEQ_CONFIG_MAGIC = 0x4E534551; // 'NSEQ'
+static const uint16_t SEQ_CONFIG_VERSION = 1;
+static const int DEFAULT_SEQ_OPEN_DEG = 30;
+static const int DEFAULT_SEQ_CLOSE_DEG = 85;
+static const int DEFAULT_SEQ_HOLD_MS = 200;
+static const int DEFAULT_SEQ_CYCLES = 5;
+static const int DEFAULT_SEQ_REST_MS = 10000;
+
+#pragma pack(push, 1)
+struct SequenceConfigBlob {
+  uint32_t magic;
+  uint16_t version;
+  int16_t open_deg;
+  int16_t close_deg;
+  int16_t cycles_per_session;
+  int32_t hold_ms;
+  int32_t rest_ms;
+};
+#pragma pack(pop)
+
+static bool isValidSequenceConfig(int open, int close, int hold, int cycles, int rest) {
+  if (open < MIN_SERVO || open > MAX_SERVO || close < MIN_SERVO || close > MAX_SERVO) return false;
+  if (open == close) return false;
+  if (hold < 50 || hold > 5000) return false;
+  if (cycles < 1 || cycles > 100) return false;
+  if (rest < 0 || rest > 3600000) return false;
+  return true;
+}
+
+static int seq_open_deg = DEFAULT_SEQ_OPEN_DEG;
+static int seq_close_deg = DEFAULT_SEQ_CLOSE_DEG;
+static int seq_hold_ms = DEFAULT_SEQ_HOLD_MS;
+static int seq_cycles_per_session = DEFAULT_SEQ_CYCLES;
+static int seq_rest_ms = DEFAULT_SEQ_REST_MS;
 // ponytail: default motion profile for moveServo; change to MotionProfile::SCurve for smooth ease-in/ease-out
 static MotionProfile seq_motion_profile = MotionProfile::Exponential;
 static uint32_t seq_move_duration_ms = 3000;
+
+void loadSavedSequenceConfig() {
+  Preferences prefs;
+  bool valid = false;
+  if (prefs.begin("noyaseq", true)) {
+    SequenceConfigBlob blob;
+    size_t readBytes = prefs.getBytes("seqcfg", &blob, sizeof(blob));
+    prefs.end();
+    if (readBytes == sizeof(blob) &&
+        blob.magic == SEQ_CONFIG_MAGIC &&
+        blob.version == SEQ_CONFIG_VERSION &&
+        isValidSequenceConfig(blob.open_deg, blob.close_deg, blob.hold_ms, blob.cycles_per_session, blob.rest_ms)) {
+      seq_open_deg = blob.open_deg;
+      seq_close_deg = blob.close_deg;
+      seq_hold_ms = blob.hold_ms;
+      seq_cycles_per_session = blob.cycles_per_session;
+      seq_rest_ms = blob.rest_ms;
+      valid = true;
+      Serial.printf("[Config] Loaded saved sequence: open=%d close=%d hold=%d cycles=%d rest=%d\n",
+                    seq_open_deg, seq_close_deg, seq_hold_ms, seq_cycles_per_session, seq_rest_ms);
+    }
+  }
+
+  if (!valid) {
+    seq_open_deg = DEFAULT_SEQ_OPEN_DEG;
+    seq_close_deg = DEFAULT_SEQ_CLOSE_DEG;
+    seq_hold_ms = DEFAULT_SEQ_HOLD_MS;
+    seq_cycles_per_session = DEFAULT_SEQ_CYCLES;
+    seq_rest_ms = DEFAULT_SEQ_REST_MS;
+    Serial.println("[Config] Using default sequence configuration");
+  }
+}
 
 static int commanded_angles[NUM_SERVOS] = { START_DEG, START_DEG, START_DEG, START_DEG, START_DEG };
 static char servo_status_str[NUM_SERVOS][16] = { "IDLE", "IDLE", "PARKED", "PARKED", "PARKED" };
@@ -1049,6 +1114,11 @@ void handleApiSequence() {
     }
   }
 
+  if (!isValidSequenceConfig(open, close, hold, cycles, rest)) {
+    server.send(400, "application/json", "{\"error\":\"Invalid sequence parameters\"}");
+    return;
+  }
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   seq_open_deg = open;
   seq_close_deg = close;
@@ -1067,17 +1137,75 @@ void handleApiSequence() {
 void handleApiSequenceReset() {
   if (!checkMutationAuth()) return;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  seq_open_deg = 30;
-  seq_close_deg = 85;
-  seq_hold_ms = 200;
-  seq_cycles_per_session = 5;
-  seq_rest_ms = 10000;
+  seq_open_deg = DEFAULT_SEQ_OPEN_DEG;
+  seq_close_deg = DEFAULT_SEQ_CLOSE_DEG;
+  seq_hold_ms = DEFAULT_SEQ_HOLD_MS;
+  seq_cycles_per_session = DEFAULT_SEQ_CYCLES;
+  seq_rest_ms = DEFAULT_SEQ_REST_MS;
   xSemaphoreGive(stateMutex);
 
   restartServoSeq(0);
   restartServoSeq(1);
 
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiSequenceSave() {
+  if (!checkMutationAuth()) return;
+
+  int open, close, hold, cycles, rest;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  open = seq_open_deg;
+  close = seq_close_deg;
+  hold = seq_hold_ms;
+  cycles = seq_cycles_per_session;
+  rest = seq_rest_ms;
+  xSemaphoreGive(stateMutex);
+
+  if (!isValidSequenceConfig(open, close, hold, cycles, rest)) {
+    server.send(400, "application/json", "{\"error\":\"Active sequence parameters are invalid\"}");
+    return;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin("noyaseq", false)) {
+    server.send(500, "application/json", "{\"error\":\"Failed to open storage\"}");
+    return;
+  }
+
+  SequenceConfigBlob stored;
+  size_t readBytes = prefs.getBytes("seqcfg", &stored, sizeof(stored));
+  if (readBytes == sizeof(stored) &&
+      stored.magic == SEQ_CONFIG_MAGIC &&
+      stored.version == SEQ_CONFIG_VERSION &&
+      stored.open_deg == (int16_t)open &&
+      stored.close_deg == (int16_t)close &&
+      stored.cycles_per_session == (int16_t)cycles &&
+      stored.hold_ms == (int32_t)hold &&
+      stored.rest_ms == (int32_t)rest) {
+    prefs.end();
+    server.send(200, "application/json", "{\"ok\":true,\"saved\":false,\"message\":\"Unchanged\"}");
+    return;
+  }
+
+  SequenceConfigBlob toWrite;
+  toWrite.magic = SEQ_CONFIG_MAGIC;
+  toWrite.version = SEQ_CONFIG_VERSION;
+  toWrite.open_deg = (int16_t)open;
+  toWrite.close_deg = (int16_t)close;
+  toWrite.cycles_per_session = (int16_t)cycles;
+  toWrite.hold_ms = (int32_t)hold;
+  toWrite.rest_ms = (int32_t)rest;
+
+  size_t written = prefs.putBytes("seqcfg", &toWrite, sizeof(toWrite));
+  prefs.end();
+
+  if (written != sizeof(toWrite)) {
+    server.send(500, "application/json", "{\"error\":\"Failed to write storage\"}");
+    return;
+  }
+
+  server.send(200, "application/json", "{\"ok\":true,\"saved\":true}");
 }
 
 void initWebServer() {
@@ -1116,6 +1244,7 @@ void initWebServer() {
   server.on("/api/relay", HTTP_POST, handleApiRelay);
   server.on("/api/sequence", HTTP_POST, handleApiSequence);
   server.on("/api/sequence/reset", HTTP_POST, handleApiSequenceReset);
+  server.on("/api/sequence/save", HTTP_POST, handleApiSequenceSave);
 
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
@@ -1161,6 +1290,8 @@ void setup() {
   stateMutex = xSemaphoreCreateMutex();
   servoQueue1 = xQueueCreate(5, sizeof(ServoCommand));
   servoQueue2 = xQueueCreate(5, sizeof(ServoCommand));
+
+  loadSavedSequenceConfig();
 
   initWiFi();
   initOTA();

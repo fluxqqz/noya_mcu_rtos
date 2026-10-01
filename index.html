@@ -270,11 +270,16 @@
                 </div>
               </div>
 
+              <p class="field-hint settings-persist-hint">
+                <strong>RAM vs Flash:</strong> Apply updates active sequence in RAM immediately. Reset Defaults restores factory defaults in RAM. Save to Device persists active sequence to flash for reboot.
+              </p>
+
               <div id="settings-feedback" class="feedback-msg" role="status" aria-live="polite"></div>
 
               <div class="form-btn-row">
                 <button type="button" id="btn-reset-settings" class="btn btn-secondary" disabled>Reset Defaults</button>
-                <button type="submit" id="btn-save-settings" class="btn btn-primary" disabled>Save Settings</button>
+                <button type="submit" id="btn-save-settings" class="btn btn-secondary" disabled>Apply</button>
+                <button type="button" id="btn-save-device" class="btn btn-primary" disabled>Save to Device</button>
               </div>
             </form>
           </div>
