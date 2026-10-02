@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <ESP32Servo.h>
 #include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <ElegantOTA.h>
@@ -11,11 +13,33 @@
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 #include "secrets.h"
 
-const char* MDNS_HOST = "mcu-eye-monster";
-// const char* MDNS_HOST = "mcu-plant-1";
-// const char* MDNS_HOST = "mcu-plant-2";
-// const char* MDNS_HOST = "mcu-plant-3";
-// const char* MDNS_HOST = "mcu-plant-4";
+// ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
+// Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
+#ifndef SLAVE_INDEX
+#define SLAVE_INDEX 1
+#endif
+
+#if SLAVE_INDEX == 1
+const char* MDNS_HOST = "mcu-plant-1";
+#elif SLAVE_INDEX == 2
+const char* MDNS_HOST = "mcu-plant-2";
+#elif SLAVE_INDEX == 3
+const char* MDNS_HOST = "mcu-plant-3";
+#elif SLAVE_INDEX == 4
+const char* MDNS_HOST = "mcu-plant-4";
+#else
+const char* MDNS_HOST = "mcu-plant-custom";
+#endif
+
+const uint8_t SLAVE_MAC[6] = { 0x02, 0x02, 0x00, 0x00, 0x00, (uint8_t)(SLAVE_INDEX + 1) };
+
+typedef struct __attribute__((packed)) {
+  uint32_t cmd_id;       // Unique command ID for deduplication
+  uint8_t  servo_idx;    // 0 = Mouth 1 (GPIO 5), 1 = Mouth 2 (GPIO 1)
+  uint8_t  open_angle;   // Open angle & resting position (0..180 deg)
+  uint8_t  close_angle;  // Closed position (0..180 deg)
+  uint32_t duration_ms;  // Active animation duration in milliseconds
+} AnimatronicCommand;
 
 const bool IS_SENSOR = false;
 
@@ -162,6 +186,72 @@ static bool servo_attached[NUM_SERVOS] = { true, true, true, true, true };
 static int last_actual_pulse_us[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
 static bool relay_states[2] = { false, false };
 
+// Animatronic remote animation state (Mouth 1 = index 0, Mouth 2 = index 1)
+static bool     anim_active[2]      = { false, false };
+static uint32_t anim_cmd_id[2]      = { 0, 0 };
+static int      anim_open_deg[2]    = { 30, 30 };
+static int      anim_close_deg[2]   = { 85, 85 };
+static uint32_t anim_deadline_ms[2] = { 0, 0 };
+
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+#else
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+#endif
+  if (len != sizeof(AnimatronicCommand)) {
+    Serial.printf("[ESP-NOW] Invalid size: %d bytes (expected %d)\n", len, (int)sizeof(AnimatronicCommand));
+    return;
+  }
+
+  AnimatronicCommand cmd;
+  memcpy(&cmd, incomingData, sizeof(cmd));
+
+  if (cmd.servo_idx >= 2) {
+    Serial.printf("[ESP-NOW] Invalid servo index: %d\n", cmd.servo_idx);
+    return;
+  }
+
+  int idx = cmd.servo_idx;
+  int open_deg  = constrain((int)cmd.open_angle, MIN_SERVO, MAX_SERVO);
+  int close_deg = constrain((int)cmd.close_angle, MIN_SERVO, MAX_SERVO);
+
+  if (stateMutex) {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+    // Duplicate check: if master re-sent identical command ID, ignore
+    if (cmd.cmd_id != 0 && cmd.cmd_id == anim_cmd_id[idx]) {
+      xSemaphoreGive(stateMutex);
+      return;
+    }
+
+    anim_cmd_id[idx]      = cmd.cmd_id;
+    anim_open_deg[idx]    = open_deg;
+    anim_close_deg[idx]   = close_deg;
+    anim_deadline_ms[idx] = millis() + cmd.duration_ms;
+    anim_active[idx]      = true;
+
+    // Preempt active motion / pause; worker task will interpolate from last_actual_pulse_us
+    servoEpoch[idx]++;
+    servo_running[idx]    = true;
+    explicit_stopped[idx] = false;
+    servo_cycle[idx]      = 1;
+    servo_rest_until[idx] = 0;
+
+    strncpy(servo_status_str[idx], "ANIMATING", sizeof(servo_status_str[idx]) - 1);
+    servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+    strncpy(servo_phase_str[idx], "active", sizeof(servo_phase_str[idx]) - 1);
+    servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+
+    QueueHandle_t q = (idx == 0) ? servoQueue1 : servoQueue2;
+    if (q) xQueueReset(q);
+
+    xSemaphoreGive(stateMutex);
+
+    Serial.printf("[ESP-NOW] Accepted Cmd #%u: Mouth %d, Open:%d Close:%d Dur:%ums\n",
+                  cmd.cmd_id, idx + 1, open_deg, close_deg, cmd.duration_ms);
+  }
+}
+
 // Thread-safe state helpers
 uint32_t bumpServoEpoch(int servoIndex) {
   if (!stateMutex || servoIndex < 0 || servoIndex >= NUM_SERVOS) return 0;
@@ -287,6 +377,10 @@ bool triggerSensorStart(int index) {
 // ─── WIFI & MDNS ─────────────────────────────────────────────────────────────
 void initWiFi() {
   WiFi.mode(WIFI_AP_STA);
+
+  // Configure fixed custom STA MAC matching master peers list
+  esp_wifi_set_mac(WIFI_IF_STA, (uint8_t*)SLAVE_MAC);
+
   WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
 
   bool apOk = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
@@ -487,29 +581,39 @@ void servoWorkerTask(void* pvParameters) {
       xSemaphoreGive(stateMutex);
     }
 
-    // 2. Session execution: N cycles of (open -> hold -> close -> hold) then rest closed
+    // 2. Execution: Remote ESP-NOW animatronic command OR local session
     bool run = false;
+    bool isAnim = false;
     int openDeg = 30, closeDeg = 85, holdMs = 200;
     int cyclesPerSession = 5, restMs = 10000;
     MotionProfile profile = MotionProfile::Exponential;
     uint32_t durationMs = 1000;
+    uint32_t deadlineMs = 0;
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     if (!isPaused && servo_running[idx] && servo_attached[idx]) {
       run = true;
       token = servoEpoch[idx];
-      openDeg = seq_open_deg;
-      closeDeg = seq_close_deg;
-      holdMs = seq_hold_ms;
-      cyclesPerSession = seq_cycles_per_session;
-      restMs = seq_rest_ms;
       profile = seq_motion_profile;
       durationMs = seq_move_duration_ms;
-      if (currentToken != token) {
-        currentToken = token;
-        currentCycle = 1;
-        servo_cycle[idx] = 1;
-        servo_rest_until[idx] = 0;
+      holdMs = seq_hold_ms;
+
+      if (anim_active[idx]) {
+        isAnim = true;
+        openDeg = anim_open_deg[idx];
+        closeDeg = anim_close_deg[idx];
+        deadlineMs = anim_deadline_ms[idx];
+      } else {
+        openDeg = seq_open_deg;
+        closeDeg = seq_close_deg;
+        cyclesPerSession = seq_cycles_per_session;
+        restMs = seq_rest_ms;
+        if (currentToken != token) {
+          currentToken = token;
+          currentCycle = 1;
+          servo_cycle[idx] = 1;
+          servo_rest_until[idx] = 0;
+        }
       }
     } else {
       currentToken = 0;
@@ -517,7 +621,72 @@ void servoWorkerTask(void* pvParameters) {
     }
     xSemaphoreGive(stateMutex);
 
-    if (run) {
+    if (run && isAnim) {
+      uint32_t now = millis();
+      // Check if animation duration has expired
+      if ((int32_t)(now - deadlineMs) >= 0) {
+        // Expired -> Return to OPEN resting position
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        if (servoEpoch[idx] == token && !isPaused && servo_attached[idx]) {
+          commanded_angles[idx] = openDeg;
+          strncpy(servo_phase_str[idx], "open", sizeof(servo_phase_str[idx]) - 1);
+          servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+          strncpy(servo_status_str[idx], "REST OPEN", sizeof(servo_status_str[idx]) - 1);
+          servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+        }
+        xSemaphoreGive(stateMutex);
+
+        moveServo(openDeg, s, idx, token, profile, durationMs);
+
+        // Finalize rest state under mutex
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        if (servoEpoch[idx] == token) {
+          anim_active[idx] = false;
+          servo_running[idx] = false;
+          strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
+          servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+          strncpy(servo_status_str[idx], "IDLE", sizeof(servo_status_str[idx]) - 1);
+          servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+        }
+        xSemaphoreGive(stateMutex);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+
+      // Step A: Target Close & hold
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+        commanded_angles[idx] = closeDeg;
+        strncpy(servo_phase_str[idx], "close", sizeof(servo_phase_str[idx]) - 1);
+        servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+        strncpy(servo_status_str[idx], "CLOSE", sizeof(servo_status_str[idx]) - 1);
+        servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+      }
+      xSemaphoreGive(stateMutex);
+
+      moveServo(closeDeg, s, idx, token, profile, durationMs);
+      if (!waitEpochDelay(idx, token, holdMs)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+
+      // Step B: Target Open & hold
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
+        commanded_angles[idx] = openDeg;
+        strncpy(servo_phase_str[idx], "open", sizeof(servo_phase_str[idx]) - 1);
+        servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+        strncpy(servo_status_str[idx], "OPEN", sizeof(servo_status_str[idx]) - 1);
+        servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+      }
+      xSemaphoreGive(stateMutex);
+
+      moveServo(openDeg, s, idx, token, profile, durationMs);
+      if (!waitEpochDelay(idx, token, holdMs)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+    } else if (run && !isAnim) {
       // Step A: Target Open & hold
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
@@ -1321,9 +1490,23 @@ void setup() {
   digitalWrite(RELAY_1, LOW);
   digitalWrite(RELAY_2, LOW);
 
-  if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 16384, NULL, 1, NULL, 0) != pdPASS) {
-    Serial.println("[WiFi] ERROR: Could not create WiFi task; STA unavailable. AP remains enabled.");
+  // ESP-NOW Initialization
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] Init failed!");
+  } else {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    esp_now_register_recv_cb(onDataRecv);
+#else
+    esp_now_register_recv_cb((esp_now_recv_cb_t)onDataRecv);
+#endif
+    Serial.printf("[ESP-NOW] Slave #%d ready on MAC " MACSTR " (Channel %d)\n",
+                  SLAVE_INDEX, MAC2STR(SLAVE_MAC), AP_CHANNEL);
   }
+
+  // Station WiFi manager is disabled so radio stays locked on Channel 6 for ESP-NOW
+  // if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 16384, NULL, 1, NULL, 0) != pdPASS) {
+  //   Serial.println("[WiFi] ERROR: Could not create WiFi task; STA unavailable. AP remains enabled.");
+  // }
 
   if (xTaskCreatePinnedToCore(servoWorkerTask, "Servo 1 Task", 4096, (void*)(intptr_t)0, 1, NULL, 0) != pdPASS) {
     Serial.println("[Servo 1] ERROR: Could not create task.");
