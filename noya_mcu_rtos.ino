@@ -63,8 +63,8 @@ Servo servos[NUM_SERVOS];
 const int RELAY_1 = 4;
 const int RELAY_2 = 15;
 
-const int TRIG_PIN = 6;
-const int ECHO_PIN = 7;
+const int SENSOR_PIN = 6;
+const int SENSOR_THRESHOLD = 200;
 
 const int MAX_SERVO = 180;
 const int MIN_SERVO = 0;
@@ -252,6 +252,25 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
   }
 }
 
+// Thread-safe per-servo power control (Relay 1 for Servo 1, Relay 2 for Servo 2)
+void setServoPower(int idx, bool on) {
+  if (idx < 0 || idx >= 2) return;
+  int pin = (idx == 0) ? RELAY_1 : RELAY_2;
+
+  bool wasOn = false;
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  wasOn = relay_states[idx];
+  relay_states[idx] = on;
+  if (stateMutex) xSemaphoreGive(stateMutex);
+
+  if (on != wasOn) {
+    digitalWrite(pin, on ? HIGH : LOW);
+    if (on) {
+      vTaskDelay(pdMS_TO_TICKS(80)); // 80ms power rail stabilization delay
+    }
+  }
+}
+
 // Thread-safe state helpers
 uint32_t bumpServoEpoch(int servoIndex) {
   if (!stateMutex || servoIndex < 0 || servoIndex >= NUM_SERVOS) return 0;
@@ -317,6 +336,7 @@ void stopServoSeq(int index, bool explicitStop) {
     servoEpoch[index]++;
   }
   servo_running[index] = false;
+  anim_active[index] = false;
   servo_cycle[index] = 0;
   servo_rest_until[index] = 0;
   strncpy(servo_phase_str[index], "idle", sizeof(servo_phase_str[index]) - 1);
@@ -331,6 +351,7 @@ void stopServoSeq(int index, bool explicitStop) {
   QueueHandle_t q = (index == 0) ? servoQueue1 : servoQueue2;
   if (q) xQueueReset(q);
   xSemaphoreGive(stateMutex);
+  setServoPower(index, false);
 }
 
 void restartServoSeq(int index) {
@@ -513,19 +534,8 @@ bool waitEpochDelay(int servoIndex, uint32_t token, int delayMs) {
   return isEpochValid(servoIndex, token);
 }
 
-long readUs() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(5);
-
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  long distance = duration * 0.034 / 2;
-
-  vTaskDelay(pdMS_TO_TICKS(100));
-  return distance;
+long readSensor() {
+  return analogRead(SENSOR_PIN);
 }
 
 // ─── WORKER TASKS ─────────────────────────────────────────────────────────────
@@ -567,6 +577,7 @@ void servoWorkerTask(void* pvParameters) {
     xSemaphoreGive(stateMutex);
 
     if (hasCmd) {
+      setServoPower(idx, true);
       moveServo(cmd.angle, s, idx, token, seq_motion_profile, seq_move_duration_ms);
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       if (servoEpoch[idx] == token && !isPaused && !servo_running[idx]) {
@@ -579,6 +590,13 @@ void servoWorkerTask(void* pvParameters) {
         }
       }
       xSemaphoreGive(stateMutex);
+
+      // Power down after 500ms settling delay if no further commands pending
+      if (q == NULL || uxQueueMessagesWaiting(q) == 0) {
+        if (waitEpochDelay(idx, token, 500)) {
+          setServoPower(idx, false);
+        }
+      }
     }
 
     // 2. Execution: Remote ESP-NOW animatronic command OR local session
@@ -649,9 +667,17 @@ void servoWorkerTask(void* pvParameters) {
           servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
         }
         xSemaphoreGive(stateMutex);
+
+        // Power down after 500ms settling delay into resting open position
+        if (waitEpochDelay(idx, token, 500)) {
+          setServoPower(idx, false);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
+
+      setServoPower(idx, true);
 
       // Step A: Target Close & hold
       xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -687,6 +713,8 @@ void servoWorkerTask(void* pvParameters) {
         continue;
       }
     } else if (run && !isAnim) {
+      setServoPower(idx, true);
+
       // Step A: Target Open & hold
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
@@ -741,7 +769,17 @@ void servoWorkerTask(void* pvParameters) {
           }
           xSemaphoreGive(stateMutex);
 
-          if (!waitEpochDelay(idx, token, restMs)) {
+          // Settle 500ms into closeDeg then cut relay power for the rest period
+          int settleMs = (restMs > 500) ? 500 : restMs;
+          if (waitEpochDelay(idx, token, settleMs)) {
+            setServoPower(idx, false);
+            if (restMs > settleMs) {
+              if (!waitEpochDelay(idx, token, restMs - settleMs)) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+              }
+            }
+          } else {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
           }
@@ -780,18 +818,23 @@ void sensorServo(void* pvParameters) {
       continue;
     }
 
-    long dist = readUs();
-    if (dist < 100) hitCount++;
-    else hitCount--;
-    if (hitCount < 0) hitCount = 0;
+    long val = readSensor();
 
-    if ((hitCount > 5) && (millis() - lastMove > 3000)) {
+    // ponytail: sample at 20 Hz, clamp hitCount [0..8] to prevent sticky accumulator
+    if (val > SENSOR_THRESHOLD) {
+      if (hitCount < 8) hitCount++;
+    } else {
+      if (hitCount > 0) hitCount--;
+    }
+
+    if (hitCount >= 6 && (millis() - lastMove > 3000)) {
       if (triggerSensorStart(1)) {
         lastMove = millis();
+        Serial.printf("[Sensor] Triggered Servo 2 (raw=%ld)\n", val);
       }
       hitCount = 0;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -961,6 +1004,8 @@ void handleApiPause() {
     }
     servo_running[0] = false;
     servo_running[1] = false;
+    anim_active[0] = false;
+    anim_active[1] = false;
     servo_cycle[0] = 0;
     servo_cycle[1] = 0;
     servo_rest_until[0] = 0;
@@ -981,6 +1026,8 @@ void handleApiPause() {
     if (servoQueue1) xQueueReset(servoQueue1);
     if (servoQueue2) xQueueReset(servoQueue2);
     xSemaphoreGive(stateMutex);
+    setServoPower(0, false);
+    setServoPower(1, false);
   } else {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     isPaused = false;
@@ -1134,6 +1181,7 @@ void handleApiAttachment() {
     if (servo_attached[idx]) {
       servoEpoch[idx]++;
       servo_running[idx] = false;
+      anim_active[idx] = false;
       servo_cycle[idx] = 0;
       servo_rest_until[idx] = 0;
       servo_attached[idx] = false;
@@ -1146,6 +1194,7 @@ void handleApiAttachment() {
       servos[idx].detach();
     }
     xSemaphoreGive(stateMutex);
+    setServoPower(idx, false);
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%d,\"attached\":false}", id);
     server.send(200, "application/json", resp);
     return;
@@ -1221,12 +1270,19 @@ void handleApiRelay() {
     return;
   }
 
-  int pin = (id == 1) ? RELAY_1 : RELAY_2;
-  digitalWrite(pin, st ? HIGH : LOW);
+  // Guard: do not allow turning OFF while servo motion is actively running
+  if (st == 0) {
+    int idx = id - 1;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    bool busy = servo_running[idx] || anim_active[idx];
+    xSemaphoreGive(stateMutex);
+    if (busy) {
+      server.send(409, "application/json", "{\"error\":\"Cannot power off relay while servo motion is active\"}");
+      return;
+    }
+  }
 
-  xSemaphoreTake(stateMutex, portMAX_DELAY);
-  relay_states[id - 1] = (st != 0);
-  xSemaphoreGive(stateMutex);
+  setServoPower(id - 1, st == 1);
 
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1466,6 +1522,17 @@ void setup() {
   initOTA();
   delay(500);
 
+  pinMode(RELAY_1, OUTPUT);
+  pinMode(RELAY_2, OUTPUT);
+  pinMode(SENSOR_PIN, INPUT);
+
+  // Power on servos to park them at START_DEG during boot
+  digitalWrite(RELAY_1, HIGH);
+  digitalWrite(RELAY_2, HIGH);
+  relay_states[0] = true;
+  relay_states[1] = true;
+  delay(80); // 80ms power rail stabilization delay
+
   Serial.println("A"); Serial.flush();
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -1481,14 +1548,13 @@ void setup() {
     servo_attached[i] = servos[i].attached();
   }
 
-  pinMode(RELAY_1, OUTPUT);
-  pinMode(RELAY_2, OUTPUT);
+  delay(500); // 500ms mechanical settling delay into START_DEG
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-
+  // Power off relays so servos remain cool and quiet at rest
   digitalWrite(RELAY_1, LOW);
   digitalWrite(RELAY_2, LOW);
+  relay_states[0] = false;
+  relay_states[1] = false;
 
   // ESP-NOW Initialization
   if (esp_now_init() != ESP_OK) {
