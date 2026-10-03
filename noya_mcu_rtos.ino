@@ -13,13 +13,22 @@
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 #include "secrets.h"
 
+// ─── OPERATION MODE ──────────────────────────────────────────────────────────
+// Set true for standalone eye installation (autonomous 60s blink / 60s rest).
+// Set false for ESP-NOW slave plant installation controlled by master.
+#ifndef STANDALONE_EYES_MODE
+#define STANDALONE_EYES_MODE true
+#endif
+
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
 // Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
 #ifndef SLAVE_INDEX
 #define SLAVE_INDEX 1
 #endif
 
-#if SLAVE_INDEX == 1
+#if STANDALONE_EYES_MODE
+const char* MDNS_HOST = "mcu-eye-monster";
+#elif SLAVE_INDEX == 1
 const char* MDNS_HOST = "mcu-plant-1";
 #elif SLAVE_INDEX == 2
 const char* MDNS_HOST = "mcu-plant-2";
@@ -110,7 +119,12 @@ static const int DEFAULT_SEQ_OPEN_DEG = 30;
 static const int DEFAULT_SEQ_CLOSE_DEG = 85;
 static const int DEFAULT_SEQ_HOLD_MS = 200;
 static const int DEFAULT_SEQ_CYCLES = 5;
+#if STANDALONE_EYES_MODE
+static const int DEFAULT_SEQ_REST_MS = 60000; // 60s rest for standalone eye monster
+static const uint32_t EYE_ACTIVE_DURATION_MS = 60000; // 60s active blinking
+#else
 static const int DEFAULT_SEQ_REST_MS = 10000;
+#endif
 
 #pragma pack(push, 1)
 struct SequenceConfigBlob {
@@ -549,6 +563,7 @@ void servoWorkerTask(void* pvParameters) {
 
   int currentCycle = 1;
   uint32_t currentToken = 0;
+  uint32_t sessionDeadlineMs = 0;
 
   for (;;) {
     // 1. Process manual angle command atomically under stateMutex
@@ -631,6 +646,9 @@ void servoWorkerTask(void* pvParameters) {
           currentCycle = 1;
           servo_cycle[idx] = 1;
           servo_rest_until[idx] = 0;
+#if STANDALONE_EYES_MODE
+          sessionDeadlineMs = millis() + EYE_ACTIVE_DURATION_MS;
+#endif
         }
       }
     } else {
@@ -754,22 +772,37 @@ void servoWorkerTask(void* pvParameters) {
       }
 
       // Check session cycle completion
-      if (currentCycle >= cyclesPerSession) {
-        // Rest phase (default position closed)
+#if STANDALONE_EYES_MODE
+      bool sessionFinished = ((int32_t)(millis() - sessionDeadlineMs) >= 0);
+#else
+      bool sessionFinished = (currentCycle >= cyclesPerSession);
+#endif
+
+      if (sessionFinished) {
+        // Rest phase
         if (restMs > 0) {
+#if STANDALONE_EYES_MODE
+          int restTargetDeg = openDeg;
+          const char* restStatus = "REST OPEN";
+#else
+          int restTargetDeg = closeDeg;
+          const char* restStatus = "REST";
+#endif
           xSemaphoreTake(stateMutex, portMAX_DELAY);
           if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
             servo_cycle[idx] = currentCycle;
             servo_rest_until[idx] = millis() + (uint32_t)restMs;
-            commanded_angles[idx] = closeDeg;
+            commanded_angles[idx] = restTargetDeg;
             strncpy(servo_phase_str[idx], "rest", sizeof(servo_phase_str[idx]) - 1);
             servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
-            strncpy(servo_status_str[idx], "REST", sizeof(servo_status_str[idx]) - 1);
+            strncpy(servo_status_str[idx], restStatus, sizeof(servo_status_str[idx]) - 1);
             servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
           }
           xSemaphoreGive(stateMutex);
 
-          // Settle 500ms into closeDeg then cut relay power for the rest period
+          moveServo(restTargetDeg, s, idx, token, profile, durationMs);
+
+          // Settle 500ms into rest position then cut relay power for the rest period
           int settleMs = (restMs > 500) ? 500 : restMs;
           if (waitEpochDelay(idx, token, settleMs)) {
             setServoPower(idx, false);
@@ -791,6 +824,9 @@ void servoWorkerTask(void* pvParameters) {
           servo_rest_until[idx] = 0;
           currentCycle = 1;
           servo_cycle[idx] = 1;
+#if STANDALONE_EYES_MODE
+          sessionDeadlineMs = millis() + EYE_ACTIVE_DURATION_MS;
+#endif
         }
         xSemaphoreGive(stateMutex);
       } else {
@@ -1556,6 +1592,7 @@ void setup() {
   relay_states[0] = false;
   relay_states[1] = false;
 
+#if !STANDALONE_EYES_MODE
   // ESP-NOW Initialization
   if (esp_now_init() != ESP_OK) {
     Serial.println("[ESP-NOW] Init failed!");
@@ -1568,6 +1605,7 @@ void setup() {
     Serial.printf("[ESP-NOW] Slave #%d ready on MAC " MACSTR " (Channel %d)\n",
                   SLAVE_INDEX, MAC2STR(SLAVE_MAC), AP_CHANNEL);
   }
+#endif
 
   // Station WiFi manager is disabled so radio stays locked on Channel 6 for ESP-NOW
   // if (xTaskCreatePinnedToCore(wifiTask, "WiFi manager", 16384, NULL, 1, NULL, 0) != pdPASS) {
@@ -1581,6 +1619,15 @@ void setup() {
   if (xTaskCreatePinnedToCore(servoWorkerTask, "Servo 2 Task", 4096, (void*)(intptr_t)1, 1, NULL, 0) != pdPASS) {
     Serial.println("[Servo 2] ERROR: Could not create task.");
   }
+
+#if STANDALONE_EYES_MODE
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  isAutoMode = true;
+  xSemaphoreGive(stateMutex);
+  startServoSeq(0);
+  startServoSeq(1);
+  Serial.println("[Mode] Standalone Eye Monster: Auto-started autonomous blinking (60s active / 60s rest)");
+#endif
 
   if (IS_SENSOR) {
     if (xTaskCreatePinnedToCore(sensorServo, "Sensor Servo Task", 4096, NULL, 1, NULL, 0) != pdPASS) {
