@@ -295,9 +295,16 @@ void setServoPower(int idx, bool on) {
   if (stateMutex) xSemaphoreGive(stateMutex);
 
   if (on != wasOn) {
-    digitalWrite(pin, on ? HIGH : LOW);
     if (on) {
-      vTaskDelay(pdMS_TO_TICKS(80)); // 80ms power rail stabilization delay
+      // Ensure the hardware PWM timer is actively outputting the last pulse before connecting 5V
+      int pulse = last_actual_pulse_us[idx];
+      if (pulse >= MIN_SERVO_US && pulse <= MAX_SERVO_US) {
+        servos[idx].writeMicroseconds(pulse);
+      }
+      digitalWrite(pin, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(100)); // 100ms power rail stabilization delay
+    } else {
+      digitalWrite(pin, LOW);
     }
   }
 }
@@ -820,15 +827,10 @@ void servoWorkerTask(void* pvParameters) {
 #endif
 
       if (sessionFinished) {
-        // Rest phase
+        // Rest phase (consistently rests in openDeg across all modes)
         if (restMs > 0) {
-#if STANDALONE_EYES_MODE
           int restTargetDeg = openDeg;
           const char* restStatus = "REST OPEN";
-#else
-          int restTargetDeg = closeDeg;
-          const char* restStatus = "REST";
-#endif
           xSemaphoreTake(stateMutex, portMAX_DELAY);
           if (servoEpoch[idx] == token && !isPaused && servo_running[idx] && servo_attached[idx]) {
             servo_cycle[idx] = currentCycle;
@@ -1705,7 +1707,7 @@ void setup() {
     servo_attached[i] = servos[i].attached();
   }
 
-  delay(500); // 500ms mechanical settling delay into START_DEG
+  delay(1000); // mechanical settling delay into START_DEG
 
   // Power off relays so servos remain cool and quiet at rest
   digitalWrite(RELAY_1, LOW);
