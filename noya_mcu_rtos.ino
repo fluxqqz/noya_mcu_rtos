@@ -15,9 +15,9 @@
 
 // ─── OPERATION MODE ──────────────────────────────────────────────────────────
 // Set true for standalone eye installation (autonomous 60s blink / 60s rest).
-// Set false for ESP-NOW slave plant installation controlled by master.
+// Set false for ESP-NOW slave plant installation (or standalone sensor plant).
 #ifndef STANDALONE_EYES_MODE
-#define STANDALONE_EYES_MODE true
+#define STANDALONE_EYES_MODE false
 #endif
 
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
@@ -50,7 +50,17 @@ typedef struct __attribute__((packed)) {
   uint32_t duration_ms;  // Active animation duration in milliseconds
 } AnimatronicCommand;
 
-const bool IS_SENSOR = false;
+// ─── SENSOR INTERACTION PARAMETERS (PLANT MODE) ──────────────────────────────
+#ifndef IS_SENSOR
+const bool     IS_SENSOR                 = true;   // Enable the sensor background task
+#endif
+const int      SENSOR_PIN                = 6;      // Sensor ADC input pin (GPIO 6)
+const int      SENSOR_THRESHOLD          = 200;    // Trigger threshold (ADC 0..4095)
+
+// Adjustable Timers (milliseconds)
+const uint32_t SENSOR_MAX_ACTIVE_MS      = 60000;  // Max continuous active motion while person present (60s)
+const uint32_t SENSOR_REST_COOLDOWN_MS   = 60000;  // Strict rest cooldown (60s)
+const uint32_t SENSOR_LEAVE_TIMEOUT_MS   = 1500;   // Absence threshold to detect person left (1.5s)
 
 const char* AP_SSID = MDNS_HOST;
 const bool AP_HIDDEN = false;
@@ -71,9 +81,6 @@ Servo servos[NUM_SERVOS];
 
 const int RELAY_1 = 4;
 const int RELAY_2 = 15;
-
-const int SENSOR_PIN = 6;
-const int SENSOR_THRESHOLD = 200;
 
 const int MAX_SERVO = 180;
 const int MIN_SERVO = 0;
@@ -384,29 +391,51 @@ void restartServoSeq(int index) {
   xSemaphoreGive(stateMutex);
 }
 
-// Atomically revalidates eligibility and starts sequence without clearing explicit stop
-bool triggerSensorStart(int index) {
-  if (index < 0 || index >= 2) return false;
-  bool started = false;
+// Sensor animation helpers (animates Mouth 2 using configured sequence angles)
+bool startSensorAnim(int idx, uint32_t duration_ms) {
+  if (idx < 0 || idx >= 2) return false;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (!isPaused && !explicit_stopped[index] && servo_attached[index]) {
-    if (!servo_running[index]) {
-      servo_running[index] = true;
-      servoEpoch[index]++;
-      servo_cycle[index] = 1;
-      servo_rest_until[index] = 0;
-      strncpy(servo_phase_str[index], "open", sizeof(servo_phase_str[index]) - 1);
-      servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
-      strncpy(servo_status_str[index], "OPEN", sizeof(servo_status_str[index]) - 1);
-      servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
-      commanded_angles[index] = seq_open_deg;
-      QueueHandle_t q = (index == 0) ? servoQueue1 : servoQueue2;
-      if (q) xQueueReset(q);
-      started = true;
-    }
+  if (isPaused || explicit_stopped[idx] || !servo_attached[idx]) {
+    xSemaphoreGive(stateMutex);
+    return false;
+  }
+  anim_open_deg[idx]    = seq_open_deg;
+  anim_close_deg[idx]   = seq_close_deg;
+  anim_deadline_ms[idx] = millis() + duration_ms;
+  anim_active[idx]      = true;
+  servo_running[idx]    = true;
+  servo_cycle[idx]      = 1;
+  servo_rest_until[idx] = 0;
+  servoEpoch[idx]++;
+
+  strncpy(servo_status_str[idx], "ANIMATING", sizeof(servo_status_str[idx]) - 1);
+  servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+  strncpy(servo_phase_str[idx], "active", sizeof(servo_phase_str[idx]) - 1);
+  servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
+
+  QueueHandle_t q = (idx == 0) ? servoQueue1 : servoQueue2;
+  if (q) xQueueReset(q);
+
+  xSemaphoreGive(stateMutex);
+  return true;
+}
+
+void stopSensorAnim(int idx) {
+  if (idx < 0 || idx >= 2) return;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (anim_active[idx]) {
+    anim_deadline_ms[idx] = millis(); // Force deadline expiration now
+    servoEpoch[idx]++;                 // Abort current stroke so it returns to openDeg immediately
   }
   xSemaphoreGive(stateMutex);
-  return started;
+}
+
+bool isSensorAnimActive(int idx) {
+  if (!stateMutex || idx < 0 || idx >= 2) return false;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  bool active = anim_active[idx] && servo_running[idx] && !isPaused;
+  xSemaphoreGive(stateMutex);
+  return active;
 }
 
 // ─── WIFI & MDNS ─────────────────────────────────────────────────────────────
@@ -843,34 +872,97 @@ void servoWorkerTask(void* pvParameters) {
   }
 }
 
-// Optional sensor-based mode for Servo 2 (trigger-only, worker 2 executes motion)
+// Sensor-based interactive presence task for Mouth 2 (Servo 2, GPIO 1)
 void sensorServo(void* pvParameters) {
-  uint32_t lastMove = millis();
+  enum SensorState { SENSOR_IDLE, SENSOR_ACTIVE, SENSOR_COOLDOWN };
+  SensorState state = SENSOR_IDLE;
+
   int hitCount = 0;
+  uint32_t sessionStartMs = 0;
+  uint32_t lastDetectedMs = 0;
+  uint32_t cooldownStartMs = 0;
+
+  Serial.println("[Sensor] Sensor presence task started for Mouth 2.");
 
   for (;;) {
     if (getIsPaused()) {
+      if (state == SENSOR_ACTIVE) {
+        stopSensorAnim(1);
+        state = SENSOR_COOLDOWN;
+        cooldownStartMs = millis();
+      }
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
     long val = readSensor();
 
-    // ponytail: sample at 20 Hz, clamp hitCount [0..8] to prevent sticky accumulator
-    if (val > SENSOR_THRESHOLD) {
-      if (hitCount < 8) hitCount++;
-    } else {
-      if (hitCount > 0) hitCount--;
-    }
+    switch (state) {
+      case SENSOR_IDLE: {
+        // Sample at 20 Hz, clamp hitCount [0..8] (~300ms sustained presence required)
+        if (val > SENSOR_THRESHOLD) {
+          if (hitCount < 8) hitCount++;
+        } else {
+          if (hitCount > 0) hitCount--;
+        }
 
-    if (hitCount >= 6 && (millis() - lastMove > 3000)) {
-      if (triggerSensorStart(1)) {
-        lastMove = millis();
-        Serial.printf("[Sensor] Triggered Servo 2 (raw=%ld)\n", val);
+        if (hitCount >= 6) {
+          if (startSensorAnim(1, SENSOR_MAX_ACTIVE_MS)) {
+            sessionStartMs = millis();
+            lastDetectedMs = millis();
+            state = SENSOR_ACTIVE;
+            hitCount = 0;
+            Serial.printf("[Sensor] Person detected (raw=%ld). Starting Mouth 2 session (max %us).\n",
+                          val, (unsigned)(SENSOR_MAX_ACTIVE_MS / 1000));
+          }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        break;
       }
-      hitCount = 0;
+
+      case SENSOR_ACTIVE: {
+        // Check if motion was stopped externally (e.g. from web UI)
+        if (!isSensorAnimActive(1)) {
+          state = SENSOR_COOLDOWN;
+          cooldownStartMs = millis();
+          hitCount = 0;
+          break;
+        }
+
+        // Update presence timestamp while person is still in front of sensor
+        if (val > SENSOR_THRESHOLD) {
+          lastDetectedMs = millis();
+        }
+
+        uint32_t now = millis();
+        bool maxReached = ((uint32_t)(now - sessionStartMs) >= SENSOR_MAX_ACTIVE_MS);
+        bool personLeft = ((uint32_t)(now - lastDetectedMs) >= SENSOR_LEAVE_TIMEOUT_MS);
+
+        if (maxReached || personLeft) {
+          stopSensorAnim(1);
+          state = SENSOR_COOLDOWN;
+          cooldownStartMs = now;
+          hitCount = 0;
+          Serial.printf("[Sensor] Active session ended (%s). Entering %us rest cooldown (resting OPEN).\n",
+                        maxReached ? "max 60s reached" : "person left",
+                        (unsigned)(SENSOR_REST_COOLDOWN_MS / 1000));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+        break;
+      }
+
+      case SENSOR_COOLDOWN: {
+        // Ignore all sensor readings during strict 60s rest cooldown
+        if ((uint32_t)(millis() - cooldownStartMs) >= SENSOR_REST_COOLDOWN_MS) {
+          state = SENSOR_IDLE;
+          hitCount = 0;
+          Serial.println("[Sensor] Rest cooldown complete. Ready for next person.");
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        break;
+      }
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -1629,7 +1721,7 @@ void setup() {
   Serial.println("[Mode] Standalone Eye Monster: Auto-started autonomous blinking (60s active / 60s rest)");
 #endif
 
-  if (IS_SENSOR) {
+  if (IS_SENSOR && !STANDALONE_EYES_MODE) {
     if (xTaskCreatePinnedToCore(sensorServo, "Sensor Servo Task", 4096, NULL, 1, NULL, 0) != pdPASS) {
       Serial.println("[Sensor] ERROR: Could not create task.");
     }

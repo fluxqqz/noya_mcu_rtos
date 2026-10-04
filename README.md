@@ -91,6 +91,20 @@ All user-configurable parameters are located near the top of `noya_mcu_rtos.ino`
 
 ---
 
+### E. Sensor Presence Interaction (Plant Mode)
+
+When `STANDALONE_EYES_MODE` is `false` and `IS_SENSOR` is `true`, Mouth 2 interacts with people walking up to the plant:
+
+| Parameter | Location | Default | Description |
+|---|---|---|---|
+| `IS_SENSOR` | Line 54 | `true` | Enables the background sensor task (`GPIO 6`). |
+| `SENSOR_THRESHOLD` | Line 58 | `200` | Analog ADC threshold (`0..4095`) to detect person presence. |
+| `SENSOR_MAX_ACTIVE_MS` | Line 61 | `60000` | Maximum continuous movement duration (60s) while person is present. |
+| `SENSOR_REST_COOLDOWN_MS` | Line 62 | `60000` | Strict cooldown rest (60s) where sensor triggers are ignored; mouth rests OPEN with Relay 2 OFF. |
+| `SENSOR_LEAVE_TIMEOUT_MS` | Line 63 | `1500` | Absence timeout (1.5s) before recognizing the person has walked away. Stepping back for < 1.5s does not stop the mouth. |
+
+---
+
 ## 3. Master ESP Parameters (`master_esp\master_esp.ino`)
 
 The Master ESP coordinates choreographed multi-plant dialogue and chorus routines.
