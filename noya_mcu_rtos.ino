@@ -52,7 +52,7 @@ typedef struct __attribute__((packed)) {
 
 // ─── SENSOR INTERACTION PARAMETERS (PLANT MODE) ──────────────────────────────
 #ifndef IS_SENSOR
-const bool     IS_SENSOR                 = false;   // Enable the sensor background task
+const bool     IS_SENSOR                 = true;   // Enable the sensor background task
 #endif
 const int      SENSOR_PIN                = 6;      // Sensor ADC input pin (GPIO 6)
 const int      SENSOR_THRESHOLD          = 1800;    // Trigger threshold (ADC 0..4095)
