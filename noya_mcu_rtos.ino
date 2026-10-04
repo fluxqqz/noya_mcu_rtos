@@ -23,7 +23,7 @@
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
 // Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
 #ifndef SLAVE_INDEX
-#define SLAVE_INDEX 4
+#define SLAVE_INDEX 3
 #endif
 
 #if STANDALONE_EYES_MODE
@@ -55,12 +55,12 @@ typedef struct __attribute__((packed)) {
 const bool     IS_SENSOR                 = false;   // Enable the sensor background task
 #endif
 const int      SENSOR_PIN                = 6;      // Sensor ADC input pin (GPIO 6)
-const int      SENSOR_THRESHOLD          = 200;    // Trigger threshold (ADC 0..4095)
+const int      SENSOR_THRESHOLD          = 1800;    // Trigger threshold (ADC 0..4095)
 
 // Adjustable Timers (milliseconds)
 const uint32_t SENSOR_MAX_ACTIVE_MS      = 60000;  // Max continuous active motion while person present (60s)
 const uint32_t SENSOR_REST_COOLDOWN_MS   = 60000;  // Strict rest cooldown (60s)
-const uint32_t SENSOR_LEAVE_TIMEOUT_MS   = 1500;   // Absence threshold to detect person left (1.5s)
+const uint32_t SENSOR_LEAVE_TIMEOUT_MS   = 5000;   // Absence threshold to detect person left
 
 const char* AP_SSID = MDNS_HOST;
 const bool AP_HIDDEN = false;
@@ -223,6 +223,11 @@ static uint32_t anim_cmd_id[2]      = { 0, 0 };
 static int      anim_open_deg[2]    = { 30, 30 };
 static int      anim_close_deg[2]   = { 85, 85 };
 static uint32_t anim_deadline_ms[2] = { 0, 0 };
+
+// Presence sensor telemetry state
+static int      sensor_last_raw       = 0;
+static char     sensor_state_str[16]  = "IDLE";
+static uint32_t sensor_cooldown_until = 0;
 
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
@@ -911,6 +916,23 @@ void sensorServo(void* pvParameters) {
 
     long val = readSensor();
 
+    if (stateMutex) {
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      sensor_last_raw = (int)val;
+      if (state == SENSOR_IDLE) {
+        strncpy(sensor_state_str, "IDLE", sizeof(sensor_state_str) - 1);
+        sensor_cooldown_until = 0;
+      } else if (state == SENSOR_ACTIVE) {
+        strncpy(sensor_state_str, "ACTIVE", sizeof(sensor_state_str) - 1);
+        sensor_cooldown_until = 0;
+      } else if (state == SENSOR_COOLDOWN) {
+        strncpy(sensor_state_str, "COOLDOWN", sizeof(sensor_state_str) - 1);
+        sensor_cooldown_until = cooldownStartMs + SENSOR_REST_COOLDOWN_MS;
+      }
+      sensor_state_str[sizeof(sensor_state_str) - 1] = '\0';
+      xSemaphoreGive(stateMutex);
+    }
+
     switch (state) {
       case SENSOR_IDLE: {
         // Sample at 20 Hz, clamp hitCount [0..8] (~300ms sustained presence required)
@@ -1047,7 +1069,19 @@ void handleApiStatus() {
   int sCycles = seq_cycles_per_session;
   int sRest = seq_rest_ms;
   int sActive = seq_active_duration_ms;
+  int sRaw = sensor_last_raw;
+  char sSensorState[16];
+  strncpy(sSensorState, sensor_state_str, sizeof(sSensorState) - 1);
+  sSensorState[sizeof(sSensorState) - 1] = '\0';
+  uint32_t sCoolUntil = sensor_cooldown_until;
   xSemaphoreGive(stateMutex);
+
+  bool sEnabled = (IS_SENSOR && !STANDALONE_EYES_MODE);
+  if (!sEnabled || sRaw == 0) {
+    sRaw = (int)readSensor();
+  }
+  uint32_t sCooldownSec = (sCoolUntil > now) ? ((sCoolUntil - now) / 1000) : 0;
+  bool sDetected = (sRaw > SENSOR_THRESHOLD);
 
   uint32_t uptimeSec = millis() / 1000;
   uint32_t freeHeap = ESP.getFreeHeap();
@@ -1079,6 +1113,7 @@ void handleApiStatus() {
            "{\"id\":1,\"pin\":%d,\"state\":%d},"
            "{\"id\":2,\"pin\":%d,\"state\":%d}"
            "],"
+           "\"sensor\":{\"enabled\":%s,\"raw\":%d,\"threshold\":%d,\"detected\":%s,\"state\":\"%s\",\"cooldown_sec\":%u},"
            "\"eye_mode\":%s,"
            "\"sequence\":{\"open_deg\":%d,\"close_deg\":%d,\"hold_ms\":%d,\"cycles_per_session\":%d,\"rest_ms\":%d,\"active_ms\":%d}"
            "}",
@@ -1098,6 +1133,12 @@ void handleApiStatus() {
            SERVO_PINS[4], angles[4], pulses[4], statuses[4], attached[4] ? "true" : "false",
            RELAY_1, r1 ? 1 : 0,
            RELAY_2, r2 ? 1 : 0,
+           sEnabled ? "true" : "false",
+           sRaw,
+           SENSOR_THRESHOLD,
+           sDetected ? "true" : "false",
+           sSensorState,
+           sCooldownSec,
            STANDALONE_EYES_MODE ? "true" : "false",
            sOpen, sClose, sHold, sCycles, sRest, sActive);
 

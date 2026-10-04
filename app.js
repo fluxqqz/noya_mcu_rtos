@@ -185,6 +185,14 @@ function createAppState(initial = {}) {
     paused: false,
     eyeMode: false,
     config: { ...DEFAULT_CONFIG },
+    sensor: {
+      enabled: false,
+      raw: 0,
+      threshold: 200,
+      detected: false,
+      state: 'IDLE',
+      cooldownSec: 0,
+    },
     sequenceDirty: false,
     servos: {
       1: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', cycle: 0, restRemainingMs: 0, attached: true, timer: null, presets: [...DEFAULT_PRESETS] },
@@ -271,6 +279,17 @@ function applyStatusToState(state, data) {
     if (data.sequence.active_ms !== undefined) {
       state.config.activeMs = data.sequence.active_ms;
     }
+  }
+
+  if (data.sensor && typeof data.sensor === 'object') {
+    state.sensor = {
+      enabled: Boolean(data.sensor.enabled),
+      raw: Number.isFinite(data.sensor.raw) ? Number(data.sensor.raw) : 0,
+      threshold: Number.isFinite(data.sensor.threshold) ? Number(data.sensor.threshold) : 200,
+      detected: Boolean(data.sensor.detected),
+      state: data.sensor.state || 'IDLE',
+      cooldownSec: Number.isFinite(data.sensor.cooldown_sec) ? Number(data.sensor.cooldown_sec) : 0,
+    };
   }
 
   return true;
@@ -510,6 +529,11 @@ if (typeof window !== 'undefined') {
       relay2Toggle: document.getElementById('relay-2-toggle'),
       relay2Text: document.getElementById('relay-2-text'),
 
+      sensorRawVal: document.getElementById('sensor-raw-val'),
+      sensorThreshVal: document.getElementById('sensor-thresh-val'),
+      sensorStateText: document.getElementById('sensor-state-text'),
+      sensorBadge: document.getElementById('sensor-badge'),
+
       settingsForm: document.getElementById('settings-form'),
       fieldCycles: document.getElementById('field-cycles'),
       fieldActive: document.getElementById('field-active'),
@@ -641,6 +665,39 @@ if (typeof window !== 'undefined') {
       label.className = `relay-state ${on ? 'state-on' : ''}`;
     }
 
+    function updateSensorUI() {
+      if (!dom.sensorRawVal || !state.sensor) return;
+      const s = state.sensor;
+      dom.sensorRawVal.textContent = state.connected ? String(s.raw) : '--';
+      if (dom.sensorThreshVal) {
+        dom.sensorThreshVal.textContent = String(s.threshold);
+      }
+      if (dom.sensorStateText) {
+        if (!state.connected) {
+          dom.sensorStateText.textContent = '--';
+        } else if (s.state === 'COOLDOWN' && s.cooldownSec > 0) {
+          dom.sensorStateText.textContent = `COOLDOWN (${s.cooldownSec}s)`;
+        } else {
+          dom.sensorStateText.textContent = s.state;
+        }
+      }
+      if (dom.sensorBadge) {
+        if (!state.connected) {
+          dom.sensorBadge.textContent = 'OFFLINE';
+          dom.sensorBadge.className = 'sensor-badge badge-disabled';
+        } else if (!s.enabled) {
+          dom.sensorBadge.textContent = 'INACTIVE';
+          dom.sensorBadge.className = 'sensor-badge badge-disabled';
+        } else if (s.detected) {
+          dom.sensorBadge.textContent = 'DETECTED';
+          dom.sensorBadge.className = 'sensor-badge badge-detected';
+        } else {
+          dom.sensorBadge.textContent = 'CLEAR';
+          dom.sensorBadge.className = 'sensor-badge badge-clear';
+        }
+      }
+    }
+
     function updateControlsDisabledState() {
       const isConnected = state.connected;
       const isPaused = state.paused;
@@ -731,6 +788,7 @@ if (typeof window !== 'undefined') {
     }
 
     function updateStatusBar() {
+      updateSensorUI();
       if (!state.connected) {
         dom.statMode.textContent = 'OFFLINE';
         dom.statSim.textContent = 'DISCONNECTED';
@@ -863,6 +921,7 @@ if (typeof window !== 'undefined') {
           updateServoUI(2);
           updateRelayUI(1);
           updateRelayUI(2);
+          updateSensorUI();
           syncSettingsFromStatus(res.data.sequence);
           updateDeviceInfoUI(res.data);
 
@@ -1413,6 +1472,7 @@ if (typeof window !== 'undefined') {
       if (dom.infoConnMode) dom.infoConnMode.textContent = 'Offline preview (file:// protocol)';
       dom.btnPauseSim.textContent = 'Pause Sim';
       state.connected = true;
+      state.sensor = { enabled: true, raw: 45, threshold: 200, detected: false, state: 'IDLE', cooldownSec: 0 };
       if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
       if (dom.cfgActive) dom.cfgActive.value = DEFAULT_CONFIG.activeMs / 1000;
       if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
@@ -1571,6 +1631,7 @@ async function runSelfTest() {
       { id: 2, angle: 85, running: true, phase: 'rest', status: 'REST', cycle: 5, rest_remaining_ms: 8500, attached: true },
     ],
     relays: [{ id: 1, state: 1 }, { id: 2, state: 0 }],
+    sensor: { enabled: true, raw: 345, threshold: 200, detected: true, state: 'ACTIVE', cooldown_sec: 0 },
     sequence: { open_deg: 40, close_deg: 90, hold_ms: 300, cycles_per_session: 8, rest_ms: 15000 },
   };
 
@@ -1583,6 +1644,8 @@ async function runSelfTest() {
   assert(mockState.servos[2].angle === 85 && mockState.servos[2].phase === 'rest', 'Servo 2 angle and phase parsed');
   assert(mockState.servos[2].cycle === 5 && mockState.servos[2].restRemainingMs === 8500, 'Servo 2 cycle and rest parsed');
   assert(mockState.relays[1] === true && mockState.relays[2] === false, 'Relays parsed');
+  assert(mockState.sensor.raw === 345 && mockState.sensor.detected === true, 'Sensor telemetry parsed');
+  assert(mockState.sensor.state === 'ACTIVE', 'Sensor state parsed');
   assert(mockState.config.openAngle === 40 && mockState.config.holdMs === 300, 'Sequence config parsed');
   assert(mockState.config.cyclesPerSession === 8 && mockState.config.restMs === 15000, 'Cycles and rest config parsed');
 
@@ -2120,6 +2183,10 @@ async function runSelfTest() {
         'relay-1-text',
         'relay-2-toggle',
         'relay-2-text',
+        'sensor-raw-val',
+        'sensor-thresh-val',
+        'sensor-state-text',
+        'sensor-badge',
         'details-settings',
         'settings-form',
         'cfg-open',

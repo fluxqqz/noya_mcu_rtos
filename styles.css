@@ -825,6 +825,86 @@ input[type="range"]::-moz-range-thumb {
   opacity: 0.5;
 }
 
+/* Presence Sensor Card */
+.sensor-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.sensor-meta {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.sensor-name {
+  font-size: 0.9375rem;
+  font-weight: 700;
+  color: var(--navy-800);
+}
+
+.sensor-metrics {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  font-size: 0.8125rem;
+  color: var(--navy-600);
+}
+
+.sensor-metrics strong {
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  color: var(--navy-900);
+}
+
+.sensor-indicators {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.sensor-state-tag {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.25rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background: var(--navy-100);
+  color: var(--navy-700);
+}
+
+.sensor-badge {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+}
+
+.sensor-badge.badge-detected {
+  background-color: #d1fae5;
+  color: #065f46;
+  border: 1px solid #a7f3d0;
+}
+
+.sensor-badge.badge-clear {
+  background-color: #f1f5f9;
+  color: #64748b;
+  border: 1px solid #e2e8f0;
+}
+
+.sensor-badge.badge-disabled {
+  background-color: #f8fafc;
+  color: #94a3b8;
+  border: 1px solid #e2e8f0;
+}
+
 /* Details Stack */
 .details-stack {
   display: flex;

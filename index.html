@@ -234,6 +234,27 @@
         </div>
       </section>
 
+      <!-- Presence Sensor -->
+      <section class="section-block" aria-labelledby="sensor-title">
+        <h2 id="sensor-title" class="section-heading">Presence Sensor</h2>
+        <div class="card sensor-card">
+          <div class="sensor-meta">
+            <div class="title-with-pin">
+              <h3 class="sensor-name">Analog Sensor</h3>
+              <span class="pin-tag">GPIO 6</span>
+            </div>
+            <div class="sensor-metrics">
+              <span class="sensor-metric-item">Raw ADC: <strong id="sensor-raw-val">--</strong> <span class="text-muted">/ 4095</span></span>
+              <span class="sensor-metric-item">Threshold: <strong id="sensor-thresh-val">200</strong></span>
+            </div>
+          </div>
+          <div class="sensor-indicators">
+            <span id="sensor-state-text" class="sensor-state-tag">IDLE</span>
+            <span id="sensor-badge" class="sensor-badge badge-clear">CLEAR</span>
+          </div>
+        </div>
+      </section>
+
       <!-- Collapsible Settings & Device Info -->
       <div class="details-stack">
 
