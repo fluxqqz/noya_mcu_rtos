@@ -87,6 +87,7 @@ All user-configurable parameters are located near the top of `noya_mcu_rtos.ino`
 | Delay | Location | Default | Description |
 |---|---|---|---|
 | **Turn-on stabilization** | Line 270 | `80 ms` | Non-blocking delay after relay clicks ON to allow the 5V rail voltage and capacitors to stabilize before sending PWM. |
+| **Manual hold torque** | Line 93 | `15000 ms` | Holding torque timeout (15s) after manual slider moves before auto-powering down the relay. Resets on new slider input. |
 | **Turn-off settling** | Line 610, 672, 794 | `500 ms` | Delay after the servo reaches its resting position before cutting relay power, ensuring mechanical gears have completely stopped. |
 
 ---

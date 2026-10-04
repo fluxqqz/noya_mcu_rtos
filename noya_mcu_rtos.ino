@@ -17,13 +17,13 @@
 // Set true for standalone eye installation (autonomous 60s blink / 60s rest).
 // Set false for ESP-NOW slave plant installation (or standalone sensor plant).
 #ifndef STANDALONE_EYES_MODE
-#define STANDALONE_EYES_MODE true
+#define STANDALONE_EYES_MODE false
 #endif
 
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
 // Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
 #ifndef SLAVE_INDEX
-#define SLAVE_INDEX 1
+#define SLAVE_INDEX 4
 #endif
 
 #if STANDALONE_EYES_MODE
@@ -52,7 +52,7 @@ typedef struct __attribute__((packed)) {
 
 // ─── SENSOR INTERACTION PARAMETERS (PLANT MODE) ──────────────────────────────
 #ifndef IS_SENSOR
-const bool     IS_SENSOR                 = true;   // Enable the sensor background task
+const bool     IS_SENSOR                 = false;   // Enable the sensor background task
 #endif
 const int      SENSOR_PIN                = 6;      // Sensor ADC input pin (GPIO 6)
 const int      SENSOR_THRESHOLD          = 200;    // Trigger threshold (ADC 0..4095)
@@ -88,6 +88,9 @@ const int MAX_SERVO_US = 2500;
 const int MIN_SERVO_US = 500;
 
 const int START_DEG = 50;
+
+// Holding torque timeout for manual commands
+const uint32_t MANUAL_SERVO_HOLD_MS = 60000;
 
 // ─── RTOS TASK QUEUES & SYNCHRONIZATION ───────────────────────────────────────
 enum ServoCmdType {
@@ -642,9 +645,9 @@ void servoWorkerTask(void* pvParameters) {
       }
       xSemaphoreGive(stateMutex);
 
-      // Power down after 500ms settling delay if no further commands pending
+      // Hold position with active power for MANUAL_SERVO_HOLD_MS, then power down if no further commands arrive
       if (q == NULL || uxQueueMessagesWaiting(q) == 0) {
-        if (waitEpochDelay(idx, token, 500)) {
+        if (waitEpochDelay(idx, token, MANUAL_SERVO_HOLD_MS)) {
           setServoPower(idx, false);
         }
       }
