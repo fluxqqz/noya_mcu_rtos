@@ -11,6 +11,7 @@ const DEFAULT_CONFIG = Object.freeze({
   holdMs: 200,
   cyclesPerSession: 5,
   restMs: 10000,
+  activeMs: 60000,
 });
 
 const DEFAULT_PRESETS = Object.freeze([30, 85]);
@@ -22,6 +23,7 @@ const DEFAULT_PRESETS = Object.freeze([30, 85]);
  * - holdMs: integer 50-5000ms
  * - cyclesPerSession: integer 1-100, default 5
  * - restMs: integer 0-3600000ms, default 10000 (accepts restMs or restSec with explicit conversion)
+ * - activeMs: integer 1000-3600000ms, default 60000 (accepts activeMs or activeSec with explicit conversion)
  */
 function validateSettings(cfg) {
   if (!cfg || typeof cfg !== 'object') {
@@ -74,10 +76,30 @@ function validateSettings(cfg) {
     return { valid: false, error: 'Rest duration must be an integer between 0 ms and 3600000 ms (0–3600 s)' };
   }
 
+  let rawActiveMs;
+  if (cfg.activeMs !== undefined) {
+    rawActiveMs = cfg.activeMs;
+  } else if (cfg.active_ms !== undefined) {
+    rawActiveMs = cfg.active_ms;
+  } else if (cfg.activeSec !== undefined) {
+    const secStr = String(cfg.activeSec).trim();
+    if (secStr === '' || !/^[+-]?\d+(\.\d+)?$/.test(secStr)) {
+      return { valid: false, error: 'Active duration must be an integer between 1000 ms and 3600000 ms (1–3600 s)' };
+    }
+    const sec = Number(secStr);
+    rawActiveMs = Number.isFinite(sec) ? Math.round(sec * 1000) : NaN;
+  } else {
+    rawActiveMs = DEFAULT_CONFIG.activeMs !== undefined ? DEFAULT_CONFIG.activeMs : 60000;
+  }
+  const activeMs = Number(rawActiveMs);
+  if (!Number.isInteger(activeMs) || activeMs < 1000 || activeMs > 3600000) {
+    return { valid: false, error: 'Active duration must be an integer between 1000 ms and 3600000 ms (1–3600 s)' };
+  }
+
   return {
     valid: true,
     error: null,
-    values: { openAngle, closeAngle, holdMs, cyclesPerSession, restMs },
+    values: { openAngle, closeAngle, holdMs, cyclesPerSession, restMs, activeMs },
   };
 }
 
@@ -161,6 +183,7 @@ function createAppState(initial = {}) {
     connected: false,
     mode: 'manual', // 'manual' | 'auto'
     paused: false,
+    eyeMode: false,
     config: { ...DEFAULT_CONFIG },
     sequenceDirty: false,
     servos: {
@@ -203,6 +226,13 @@ function applyStatusToState(state, data) {
   state.device.apIp = data.ap_ip || '192.168.10.1';
   state.device.mdns = data.mdns || 'mcu-eye-monster';
   state.device.otaAuth = data.ota_auth || 'none (preexisting limitation)';
+  if (data.eye_mode !== undefined) {
+    state.eyeMode = Boolean(data.eye_mode);
+  } else if (state.device.mdns === 'mcu-eye-monster') {
+    state.eyeMode = true;
+  } else {
+    state.eyeMode = false;
+  }
 
   if (Array.isArray(data.servos)) {
     data.servos.forEach((s) => {
@@ -237,6 +267,9 @@ function applyStatusToState(state, data) {
     }
     if (data.sequence.rest_ms !== undefined) {
       state.config.restMs = data.sequence.rest_ms;
+    }
+    if (data.sequence.active_ms !== undefined) {
+      state.config.activeMs = data.sequence.active_ms;
     }
   }
 
@@ -478,10 +511,13 @@ if (typeof window !== 'undefined') {
       relay2Text: document.getElementById('relay-2-text'),
 
       settingsForm: document.getElementById('settings-form'),
+      fieldCycles: document.getElementById('field-cycles'),
+      fieldActive: document.getElementById('field-active'),
       cfgOpen: document.getElementById('cfg-open'),
       cfgClose: document.getElementById('cfg-close'),
       cfgHold: document.getElementById('cfg-hold'),
       cfgCycles: document.getElementById('cfg-cycles'),
+      cfgActive: document.getElementById('cfg-active'),
       cfgRest: document.getElementById('cfg-rest'),
       settingsFeedback: document.getElementById('settings-feedback'),
       btnResetSettings: document.getElementById('btn-reset-settings'),
@@ -682,6 +718,7 @@ if (typeof window !== 'undefined') {
       dom.cfgClose.disabled = settingsLocked;
       dom.cfgHold.disabled = settingsLocked;
       if (dom.cfgCycles) dom.cfgCycles.disabled = settingsLocked;
+      if (dom.cfgActive) dom.cfgActive.disabled = settingsLocked;
       if (dom.cfgRest) dom.cfgRest.disabled = settingsLocked;
       dom.btnResetSettings.disabled = settingsLocked;
       if (dom.btnSaveSettings) dom.btnSaveSettings.disabled = settingsLocked;
@@ -745,11 +782,13 @@ if (typeof window !== 'undefined') {
       state.config.holdMs = seq.hold_ms;
       if (seq.cycles_per_session !== undefined) state.config.cyclesPerSession = seq.cycles_per_session;
       if (seq.rest_ms !== undefined) state.config.restMs = seq.rest_ms;
+      if (seq.active_ms !== undefined) state.config.activeMs = seq.active_ms;
 
       const isFocused = document.activeElement === dom.cfgOpen ||
                         document.activeElement === dom.cfgClose ||
                         document.activeElement === dom.cfgHold ||
                         document.activeElement === dom.cfgCycles ||
+                        document.activeElement === dom.cfgActive ||
                         document.activeElement === dom.cfgRest;
       if (!isFocused && !state.sequenceDirty) {
         dom.cfgOpen.value = seq.open_deg;
@@ -757,6 +796,9 @@ if (typeof window !== 'undefined') {
         dom.cfgHold.value = seq.hold_ms;
         if (dom.cfgCycles && seq.cycles_per_session !== undefined) {
           dom.cfgCycles.value = seq.cycles_per_session;
+        }
+        if (dom.cfgActive && seq.active_ms !== undefined) {
+          dom.cfgActive.value = seq.active_ms / 1000;
         }
         if (dom.cfgRest && seq.rest_ms !== undefined) {
           dom.cfgRest.value = seq.rest_ms / 1000;
@@ -798,6 +840,14 @@ if (typeof window !== 'undefined') {
         const res = await fetchStatus(window.fetch);
         if (res.ok) {
           applyStatusToState(state, res.data);
+
+          if (state.eyeMode) {
+            if (dom.fieldCycles) dom.fieldCycles.style.display = 'none';
+            if (dom.fieldActive) dom.fieldActive.style.display = '';
+          } else {
+            if (dom.fieldCycles) dom.fieldCycles.style.display = '';
+            if (dom.fieldActive) dom.fieldActive.style.display = 'none';
+          }
 
           const isAuto = state.mode === 'auto';
           dom.btnModeAuto.classList.toggle('active', isAuto);
@@ -1224,7 +1274,7 @@ if (typeof window !== 'undefined') {
     dom.relay2Toggle.addEventListener('change', (e) => handleRelayToggle(2, e.target.checked));
 
     // Sequence Settings Form Dirty Tracking
-    [dom.cfgOpen, dom.cfgClose, dom.cfgHold, dom.cfgCycles, dom.cfgRest].forEach((el) => {
+    [dom.cfgOpen, dom.cfgClose, dom.cfgHold, dom.cfgCycles, dom.cfgActive, dom.cfgRest].forEach((el) => {
       if (el) el.addEventListener('input', () => { state.sequenceDirty = true; });
     });
 
@@ -1238,6 +1288,7 @@ if (typeof window !== 'undefined') {
         closeAngle: dom.cfgClose.value.trim(),
         holdMs: dom.cfgHold.value.trim(),
         cyclesPerSession: dom.cfgCycles ? dom.cfgCycles.value.trim() : DEFAULT_CONFIG.cyclesPerSession,
+        activeSec: dom.cfgActive ? dom.cfgActive.value.trim() : (DEFAULT_CONFIG.activeMs / 1000),
         restSec: dom.cfgRest ? dom.cfgRest.value.trim() : (DEFAULT_CONFIG.restMs / 1000),
       };
 
@@ -1263,13 +1314,18 @@ if (typeof window !== 'undefined') {
       }
 
       // Live HTTP POST /api/sequence
-      const res = await executeApiPost('/api/sequence', {
+      const payload = {
         open_deg: result.values.openAngle,
         close_deg: result.values.closeAngle,
         hold_ms: result.values.holdMs,
         cycles_per_session: result.values.cyclesPerSession,
         rest_ms: result.values.restMs,
-      }, 'sequence');
+      };
+      if (result.values.activeMs !== undefined) {
+        payload.active_ms = result.values.activeMs;
+      }
+
+      const res = await executeApiPost('/api/sequence', payload, 'sequence');
 
       if (res.ok) {
         state.config = result.values;
@@ -1293,6 +1349,7 @@ if (typeof window !== 'undefined') {
         dom.cfgClose.value = DEFAULT_CONFIG.closeAngle;
         dom.cfgHold.value = DEFAULT_CONFIG.holdMs;
         if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
+        if (dom.cfgActive) dom.cfgActive.value = DEFAULT_CONFIG.activeMs / 1000;
         if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
         dom.settingsFeedback.textContent = 'Factory defaults restored in simulation.';
@@ -1314,6 +1371,7 @@ if (typeof window !== 'undefined') {
         dom.cfgClose.value = DEFAULT_CONFIG.closeAngle;
         dom.cfgHold.value = DEFAULT_CONFIG.holdMs;
         if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
+        if (dom.cfgActive) dom.cfgActive.value = DEFAULT_CONFIG.activeMs / 1000;
         if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
         dom.settingsFeedback.textContent = 'Factory defaults restored in RAM. Click Save to Device to persist.';
@@ -1356,6 +1414,7 @@ if (typeof window !== 'undefined') {
       dom.btnPauseSim.textContent = 'Pause Sim';
       state.connected = true;
       if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
+      if (dom.cfgActive) dom.cfgActive.value = DEFAULT_CONFIG.activeMs / 1000;
       if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
       updateServoUI(1);
       updateServoUI(2);
@@ -1438,6 +1497,14 @@ async function runSelfTest() {
   const fineFracConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, restSec: 0.125 });
   assert(fineFracConversion.valid === true && fineFracConversion.values.restMs === 125, 'Millisecond-precision restSec (0.125s -> 125ms)');
   assert(fineFracConversion.values.restMs / 1000 === 0.125, 'Millisecond-precision roundtrip (125ms / 1000 === 0.125s)');
+
+  // active_ms range validation (1000..3600000) & explicit seconds conversion
+  assert(validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, activeMs: 1000 }).valid === true, 'Active 1000 ms is valid');
+  assert(validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, activeMs: 3600000 }).valid === true, 'Active 3600000 ms is valid');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, activeMs: 999 }).valid, 'Active < 1000 ms rejected');
+  assert(!validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, activeMs: 3600001 }).valid, 'Active > 3600000 ms rejected');
+  const activeSecConversion = validateSettings({ openAngle: 30, closeAngle: 85, holdMs: 200, activeSec: 60 });
+  assert(activeSecConversion.valid === true && activeSecConversion.values.activeMs === 60000, 'Explicit conversion of activeSec (60s -> 60000ms)');
 
   // 2. Servo Angle Validation (Integer 0..180)
   assert(validateServoAngle(30).valid === true && validateServoAngle(30).value === 30, 'Integer 30 should be valid');
@@ -2059,6 +2126,7 @@ async function runSelfTest() {
         'cfg-close',
         'cfg-hold',
         'cfg-cycles',
+        'cfg-active',
         'cfg-rest',
         'settings-feedback',
         'btn-reset-settings',

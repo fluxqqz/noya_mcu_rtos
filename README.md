@@ -74,11 +74,11 @@ All user-configurable parameters are located near the top of `noya_mcu_rtos.ino`
 
 | Parameter | Location | Default | Description |
 |---|---|---|---|
-| `EYE_ACTIVE_DURATION_MS` | Line 125 | `60000` | Duration of active movement session in milliseconds (60,000 ms = **60 seconds**). |
-| `DEFAULT_SEQ_REST_MS` | Line 124 | `60000` (Eye) / `10000` (Plant) | Sleep / rest duration in milliseconds. Both relays turn **OFF** during this window. |
-| `DEFAULT_SEQ_HOLD_MS` | Line 123 | `200` | Pause duration in milliseconds at each open and closed endpoint. |
-| `seq_move_duration_ms` | Line 155 | `3000` | Stroke duration in milliseconds for each movement stroke. |
-| `seq_motion_profile` | Line 154 | `MotionProfile::Exponential` | Motion smoothing algorithm:<br>• `MotionProfile::Exponential`: Gentle ease curve.<br>• `MotionProfile::SCurve`: Ken Perlin quintic smoothstep ease-in and ease-out. |
+| `DEFAULT_SEQ_ACTIVE_MS` | Line 131 | `60000` | Duration of active movement session in milliseconds (60,000 ms = **60 seconds**). In Eye Mode, dashboard adapts to show **Active Duration (s)**. |
+| `DEFAULT_SEQ_REST_MS` | Line 130 | `60000` (Eye) / `10000` (Plant) | Sleep / rest duration in milliseconds. Both relays turn **OFF** during this window. |
+| `DEFAULT_SEQ_HOLD_MS` | Line 127 | `200` | Pause duration in milliseconds at each open and closed endpoint. |
+| `seq_move_duration_ms` | Line 164 | `3000` | Stroke duration in milliseconds for each movement stroke. |
+| `seq_motion_profile` | Line 163 | `MotionProfile::Exponential` | Motion smoothing algorithm:<br>• `MotionProfile::Exponential`: Gentle ease curve.<br>• `MotionProfile::SCurve`: Ken Perlin quintic smoothstep ease-in and ease-out. |
 
 ---
 
