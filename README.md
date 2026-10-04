@@ -92,7 +92,7 @@ All user-configurable parameters are located near the top of `noya_mcu_rtos.ino`
 
 ---
 
-### E. Sensor Presence Interaction (Plant Mode)
+### E. Sensor Presence Interaction & Built-in C6 RGB Status LED (Plant Mode)
 
 When `STANDALONE_EYES_MODE` is `false` and `IS_SENSOR` is `true`, Mouth 2 interacts with people walking up to the plant:
 
@@ -103,6 +103,21 @@ When `STANDALONE_EYES_MODE` is `false` and `IS_SENSOR` is `true`, Mouth 2 intera
 | `SENSOR_MAX_ACTIVE_MS` | Line 61 | `60000` | Maximum continuous movement duration (60s) while person is present. |
 | `SENSOR_REST_COOLDOWN_MS` | Line 62 | `60000` | Strict cooldown rest (60s) where sensor triggers are ignored; mouth rests OPEN with Relay 2 OFF. |
 | `SENSOR_LEAVE_TIMEOUT_MS` | Line 63 | `1500` | Absence timeout (1.5s) before recognizing the person has walked away. Stepping back for < 1.5s does not stop the mouth. |
+
+#### Built-in ESP32-C6 RGB LED Status (GPIO 8):
+The onboard addressable RGB LED directly signals the sensor servo presence state:
+* **Blue `(0, 0, 50)`:** **IDLE / Waiting** — Sensor armed and waiting for a person.
+* **Green `(0, 50, 0)`:** **ACTIVE (Not Rest)** — Person detected, Mouth 2 actively flapping.
+* **Red `(50, 0, 0)`:** **COOLDOWN (Rest)** — Resting OPEN with Relay 2 OFF; sensor input ignored during cooldown.
+* **Off `(0, 0, 0)`:** Device paused, booting, or sensor task disabled.
+
+---
+
+### F. Independent Per-Servo Sequences
+Servo 1 and Servo 2 each possess their own independent sequence configuration:
+* **Dashboard Tabs:** Inside Sequence Settings, click **`[ Servo 1 ]`** or **`[ Servo 2 ]`** to switch and configure angles, hold delay, cycles/active duration, and rest duration for each servo independently.
+* **Per-Servo Apply:** Clicking **Apply** updates only the selected servo's sequence in RAM.
+* **Flash Persistence:** Clicking **Save to Device** writes both Servo 1 and Servo 2 configurations into NVS flash storage (v3 blob) so both persist across reboots.
 
 ---
 

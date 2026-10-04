@@ -960,6 +960,38 @@ input[type="range"]::-moz-range-thumb {
   background-color: #ffffff;
 }
 
+/* Sequence Configuration Tabs */
+.seq-tabs-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0.65rem;
+}
+
+.seq-tab-btn {
+  padding: 0.4rem 0.85rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  background-color: #f1f5f9;
+  color: var(--navy-600);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.seq-tab-btn:hover {
+  background-color: #e2e8f0;
+  color: var(--navy-900);
+}
+
+.seq-tab-btn.active {
+  background-color: var(--teal-600);
+  color: #ffffff;
+  border-color: var(--teal-700);
+}
+
 /* Form Fields Grid */
 .fields-grid {
   display: grid;

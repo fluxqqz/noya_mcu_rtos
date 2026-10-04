@@ -23,7 +23,7 @@
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
 // Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
 #ifndef SLAVE_INDEX
-#define SLAVE_INDEX 3
+#define SLAVE_INDEX 4
 #endif
 
 #if STANDALONE_EYES_MODE
@@ -124,7 +124,7 @@ static bool isPaused = false;
 // ─── SEQUENCE CONFIGURATION & FLASH PERSISTENCE ──────────────────────────────
 // ponytail: atomic single Preferences blob for non-volatile sequence config
 static const uint32_t SEQ_CONFIG_MAGIC = 0x4E534551; // 'NSEQ'
-static const uint16_t SEQ_CONFIG_VERSION = 2;
+static const uint16_t SEQ_CONFIG_VERSION = 3;
 static const int DEFAULT_SEQ_OPEN_DEG = 30;
 static const int DEFAULT_SEQ_CLOSE_DEG = 85;
 static const int DEFAULT_SEQ_HOLD_MS = 200;
@@ -137,16 +137,29 @@ static const int DEFAULT_SEQ_REST_MS = 10000;
 static const uint32_t DEFAULT_SEQ_ACTIVE_MS = 60000;
 #endif
 
+struct SequenceConfig {
+  int open_deg;
+  int close_deg;
+  int hold_ms;
+  int cycles_per_session;
+  int rest_ms;
+  int active_duration_ms;
+};
+
 #pragma pack(push, 1)
-struct SequenceConfigBlob {
-  uint32_t magic;
-  uint16_t version;
+struct ServoSequenceData {
   int16_t open_deg;
   int16_t close_deg;
   int16_t cycles_per_session;
   int32_t hold_ms;
   int32_t rest_ms;
-  int32_t active_ms; // Active session duration (ms), used in eye mode
+  int32_t active_ms;
+};
+
+struct SequenceConfigBlob {
+  uint32_t magic;              // 'NSEQ'
+  uint16_t version;            // 3
+  ServoSequenceData servos[2];  // Index 0 = Servo 1, Index 1 = Servo 2
 };
 #pragma pack(pop)
 
@@ -160,12 +173,10 @@ static bool isValidSequenceConfig(int open, int close, int hold, int cycles, int
   return true;
 }
 
-static int seq_open_deg = DEFAULT_SEQ_OPEN_DEG;
-static int seq_close_deg = DEFAULT_SEQ_CLOSE_DEG;
-static int seq_hold_ms = DEFAULT_SEQ_HOLD_MS;
-static int seq_cycles_per_session = DEFAULT_SEQ_CYCLES;
-static int seq_rest_ms = DEFAULT_SEQ_REST_MS;
-static int seq_active_duration_ms = DEFAULT_SEQ_ACTIVE_MS;
+static SequenceConfig seq_configs[2] = {
+  { DEFAULT_SEQ_OPEN_DEG, DEFAULT_SEQ_CLOSE_DEG, DEFAULT_SEQ_HOLD_MS, DEFAULT_SEQ_CYCLES, DEFAULT_SEQ_REST_MS, (int)DEFAULT_SEQ_ACTIVE_MS },
+  { DEFAULT_SEQ_OPEN_DEG, DEFAULT_SEQ_CLOSE_DEG, DEFAULT_SEQ_HOLD_MS, DEFAULT_SEQ_CYCLES, DEFAULT_SEQ_REST_MS, (int)DEFAULT_SEQ_ACTIVE_MS }
+};
 // ponytail: default motion profile for moveServo; change to MotionProfile::SCurve for smooth ease-in/ease-out
 static MotionProfile seq_motion_profile = MotionProfile::Exponential;
 static uint32_t seq_move_duration_ms = 3000;
@@ -174,34 +185,72 @@ void loadSavedSequenceConfig() {
   Preferences prefs;
   bool valid = false;
   if (prefs.begin("noyaseq", true)) {
-    SequenceConfigBlob blob;
-    memset(&blob, 0, sizeof(blob));
-    size_t readBytes = prefs.getBytes("seqcfg", &blob, sizeof(blob));
+    uint8_t buffer[64];
+    memset(buffer, 0, sizeof(buffer));
+    size_t readBytes = prefs.getBytes("seqcfg", buffer, sizeof(buffer));
     prefs.end();
-    if (readBytes >= 20 && blob.magic == SEQ_CONFIG_MAGIC) {
-      int active = (blob.version >= 2 && readBytes >= sizeof(SequenceConfigBlob)) ? blob.active_ms : (int)DEFAULT_SEQ_ACTIVE_MS;
-      if (isValidSequenceConfig(blob.open_deg, blob.close_deg, blob.hold_ms, blob.cycles_per_session, blob.rest_ms, active)) {
-        seq_open_deg = blob.open_deg;
-        seq_close_deg = blob.close_deg;
-        seq_hold_ms = blob.hold_ms;
-        seq_cycles_per_session = blob.cycles_per_session;
-        seq_rest_ms = blob.rest_ms;
-        seq_active_duration_ms = active;
-        valid = true;
-        Serial.printf("[Config] Loaded saved sequence: open=%d close=%d hold=%d cycles=%d rest=%d active=%d\n",
-                      seq_open_deg, seq_close_deg, seq_hold_ms, seq_cycles_per_session, seq_rest_ms, seq_active_duration_ms);
+    if (readBytes >= 20) {
+      uint32_t magic = 0;
+      uint16_t version = 0;
+      memcpy(&magic, buffer, 4);
+      memcpy(&version, buffer + 4, 2);
+      if (magic == SEQ_CONFIG_MAGIC) {
+        if (version >= 3 && readBytes >= sizeof(SequenceConfigBlob)) {
+          SequenceConfigBlob blob;
+          memcpy(&blob, buffer, sizeof(blob));
+          bool ok0 = isValidSequenceConfig(blob.servos[0].open_deg, blob.servos[0].close_deg, blob.servos[0].hold_ms, blob.servos[0].cycles_per_session, blob.servos[0].rest_ms, blob.servos[0].active_ms);
+          bool ok1 = isValidSequenceConfig(blob.servos[1].open_deg, blob.servos[1].close_deg, blob.servos[1].hold_ms, blob.servos[1].cycles_per_session, blob.servos[1].rest_ms, blob.servos[1].active_ms);
+          if (ok0 && ok1) {
+            for (int i = 0; i < 2; i++) {
+              seq_configs[i].open_deg = blob.servos[i].open_deg;
+              seq_configs[i].close_deg = blob.servos[i].close_deg;
+              seq_configs[i].hold_ms = blob.servos[i].hold_ms;
+              seq_configs[i].cycles_per_session = blob.servos[i].cycles_per_session;
+              seq_configs[i].rest_ms = blob.servos[i].rest_ms;
+              seq_configs[i].active_duration_ms = blob.servos[i].active_ms;
+            }
+            valid = true;
+            Serial.println("[Config] Loaded saved per-servo sequences (v3)");
+          }
+        } else {
+          // Backward compatibility for legacy v1 or v2 (single config replicated to both servos)
+          int16_t open = 0, close = 0, cycles = 0;
+          int32_t hold = 0, rest = 0, active = (int)DEFAULT_SEQ_ACTIVE_MS;
+          memcpy(&open, buffer + 6, 2);
+          memcpy(&close, buffer + 8, 2);
+          memcpy(&cycles, buffer + 10, 2);
+          memcpy(&hold, buffer + 12, 4);
+          memcpy(&rest, buffer + 16, 4);
+          if (version >= 2 && readBytes >= 24) {
+            memcpy(&active, buffer + 20, 4);
+          }
+          if (isValidSequenceConfig(open, close, hold, cycles, rest, active)) {
+            for (int i = 0; i < 2; i++) {
+              seq_configs[i].open_deg = open;
+              seq_configs[i].close_deg = close;
+              seq_configs[i].hold_ms = hold;
+              seq_configs[i].cycles_per_session = cycles;
+              seq_configs[i].rest_ms = rest;
+              seq_configs[i].active_duration_ms = active;
+            }
+            valid = true;
+            Serial.println("[Config] Migrated legacy sequence config to both servos");
+          }
+        }
       }
     }
   }
 
   if (!valid) {
-    seq_open_deg = DEFAULT_SEQ_OPEN_DEG;
-    seq_close_deg = DEFAULT_SEQ_CLOSE_DEG;
-    seq_hold_ms = DEFAULT_SEQ_HOLD_MS;
-    seq_cycles_per_session = DEFAULT_SEQ_CYCLES;
-    seq_rest_ms = DEFAULT_SEQ_REST_MS;
-    seq_active_duration_ms = DEFAULT_SEQ_ACTIVE_MS;
-    Serial.println("[Config] Using default sequence configuration");
+    for (int i = 0; i < 2; i++) {
+      seq_configs[i].open_deg = DEFAULT_SEQ_OPEN_DEG;
+      seq_configs[i].close_deg = DEFAULT_SEQ_CLOSE_DEG;
+      seq_configs[i].hold_ms = DEFAULT_SEQ_HOLD_MS;
+      seq_configs[i].cycles_per_session = DEFAULT_SEQ_CYCLES;
+      seq_configs[i].rest_ms = DEFAULT_SEQ_REST_MS;
+      seq_configs[i].active_duration_ms = (int)DEFAULT_SEQ_ACTIVE_MS;
+    }
+    Serial.println("[Config] Using default sequence configuration for both servos");
   }
 }
 
@@ -361,7 +410,7 @@ void startServoSeq(int index) {
       servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
       strncpy(servo_status_str[index], "OPEN", sizeof(servo_status_str[index]) - 1);
       servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
-      commanded_angles[index] = seq_open_deg;
+      commanded_angles[index] = seq_configs[index].open_deg;
       QueueHandle_t q = (index == 0) ? servoQueue1 : servoQueue2;
       if (q) xQueueReset(q);
     }
@@ -408,7 +457,7 @@ void restartServoSeq(int index) {
     servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
     strncpy(servo_status_str[index], "OPEN", sizeof(servo_status_str[index]) - 1);
     servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
-    commanded_angles[index] = seq_open_deg;
+    commanded_angles[index] = seq_configs[index].open_deg;
   }
   xSemaphoreGive(stateMutex);
 }
@@ -421,8 +470,8 @@ bool startSensorAnim(int idx, uint32_t duration_ms) {
     xSemaphoreGive(stateMutex);
     return false;
   }
-  anim_open_deg[idx]    = seq_open_deg;
-  anim_close_deg[idx]   = seq_close_deg;
+  anim_open_deg[idx]    = seq_configs[idx].open_deg;
+  anim_close_deg[idx]   = seq_configs[idx].close_deg;
   anim_deadline_ms[idx] = millis() + duration_ms;
   anim_active[idx]      = true;
   servo_running[idx]    = true;
@@ -681,7 +730,7 @@ void servoWorkerTask(void* pvParameters) {
       token = servoEpoch[idx];
       profile = seq_motion_profile;
       durationMs = seq_move_duration_ms;
-      holdMs = seq_hold_ms;
+      holdMs = seq_configs[idx].hold_ms;
 
       if (anim_active[idx]) {
         isAnim = true;
@@ -689,11 +738,11 @@ void servoWorkerTask(void* pvParameters) {
         closeDeg = anim_close_deg[idx];
         deadlineMs = anim_deadline_ms[idx];
       } else {
-        openDeg = seq_open_deg;
-        closeDeg = seq_close_deg;
-        cyclesPerSession = seq_cycles_per_session;
-        restMs = seq_rest_ms;
-        activeDurationMs = seq_active_duration_ms;
+        openDeg = seq_configs[idx].open_deg;
+        closeDeg = seq_configs[idx].close_deg;
+        cyclesPerSession = seq_configs[idx].cycles_per_session;
+        restMs = seq_configs[idx].rest_ms;
+        activeDurationMs = seq_configs[idx].active_duration_ms;
         if (currentToken != token) {
           currentToken = token;
           currentCycle = 1;
@@ -902,9 +951,15 @@ void sensorServo(void* pvParameters) {
   uint32_t cooldownStartMs = 0;
 
   Serial.println("[Sensor] Sensor presence task started for Mouth 2.");
+#ifdef RGB_BUILTIN
+  rgbLedWrite(RGB_BUILTIN, 0, 0, 50); // Blue (Idle on start)
+#endif
 
   for (;;) {
     if (getIsPaused()) {
+#ifdef RGB_BUILTIN
+      rgbLedWrite(RGB_BUILTIN, 0, 0, 0); // Off when paused
+#endif
       if (state == SENSOR_ACTIVE) {
         stopSensorAnim(1);
         state = SENSOR_COOLDOWN;
@@ -935,6 +990,9 @@ void sensorServo(void* pvParameters) {
 
     switch (state) {
       case SENSOR_IDLE: {
+#ifdef RGB_BUILTIN
+        rgbLedWrite(RGB_BUILTIN, 0, 0, 50); // Blue (Waiting/Idle)
+#endif
         // Sample at 20 Hz, clamp hitCount [0..8] (~300ms sustained presence required)
         if (val > SENSOR_THRESHOLD) {
           if (hitCount < 8) hitCount++;
@@ -948,6 +1006,9 @@ void sensorServo(void* pvParameters) {
             lastDetectedMs = millis();
             state = SENSOR_ACTIVE;
             hitCount = 0;
+#ifdef RGB_BUILTIN
+            rgbLedWrite(RGB_BUILTIN, 0, 50, 0); // Green (Active / Not Rest)
+#endif
             Serial.printf("[Sensor] Person detected (raw=%ld). Starting Mouth 2 session (max %us).\n",
                           val, (unsigned)(SENSOR_MAX_ACTIVE_MS / 1000));
           }
@@ -957,11 +1018,17 @@ void sensorServo(void* pvParameters) {
       }
 
       case SENSOR_ACTIVE: {
+#ifdef RGB_BUILTIN
+        rgbLedWrite(RGB_BUILTIN, 0, 50, 0); // Green (Active / Not Rest)
+#endif
         // Check if motion was stopped externally (e.g. from web UI)
         if (!isSensorAnimActive(1)) {
           state = SENSOR_COOLDOWN;
           cooldownStartMs = millis();
           hitCount = 0;
+#ifdef RGB_BUILTIN
+          rgbLedWrite(RGB_BUILTIN, 50, 0, 0); // Red (Rest / Cooldown)
+#endif
           break;
         }
 
@@ -979,6 +1046,9 @@ void sensorServo(void* pvParameters) {
           state = SENSOR_COOLDOWN;
           cooldownStartMs = now;
           hitCount = 0;
+#ifdef RGB_BUILTIN
+          rgbLedWrite(RGB_BUILTIN, 50, 0, 0); // Red (Rest / Cooldown)
+#endif
           Serial.printf("[Sensor] Active session ended (%s). Entering %us rest cooldown (resting OPEN).\n",
                         maxReached ? "max 60s reached" : "person left",
                         (unsigned)(SENSOR_REST_COOLDOWN_MS / 1000));
@@ -989,10 +1059,16 @@ void sensorServo(void* pvParameters) {
       }
 
       case SENSOR_COOLDOWN: {
+#ifdef RGB_BUILTIN
+        rgbLedWrite(RGB_BUILTIN, 50, 0, 0); // Red (Rest / Cooldown)
+#endif
         // Ignore all sensor readings during strict 60s rest cooldown
         if ((uint32_t)(millis() - cooldownStartMs) >= SENSOR_REST_COOLDOWN_MS) {
           state = SENSOR_IDLE;
           hitCount = 0;
+#ifdef RGB_BUILTIN
+          rgbLedWrite(RGB_BUILTIN, 0, 0, 50); // Blue (Ready / Idle)
+#endif
           Serial.println("[Sensor] Rest cooldown complete. Ready for next person.");
         }
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1063,12 +1139,9 @@ void handleApiStatus() {
   }
   bool r1 = relay_states[0];
   bool r2 = relay_states[1];
-  int sOpen = seq_open_deg;
-  int sClose = seq_close_deg;
-  int sHold = seq_hold_ms;
-  int sCycles = seq_cycles_per_session;
-  int sRest = seq_rest_ms;
-  int sActive = seq_active_duration_ms;
+  SequenceConfig sCfg[2];
+  sCfg[0] = seq_configs[0];
+  sCfg[1] = seq_configs[1];
   int sRaw = sensor_last_raw;
   char sSensorState[16];
   strncpy(sSensorState, sensor_state_str, sizeof(sSensorState) - 1);
@@ -1115,6 +1188,10 @@ void handleApiStatus() {
            "],"
            "\"sensor\":{\"enabled\":%s,\"raw\":%d,\"threshold\":%d,\"detected\":%s,\"state\":\"%s\",\"cooldown_sec\":%u},"
            "\"eye_mode\":%s,"
+           "\"sequences\":["
+           "{\"id\":1,\"open_deg\":%d,\"close_deg\":%d,\"hold_ms\":%d,\"cycles_per_session\":%d,\"rest_ms\":%d,\"active_ms\":%d},"
+           "{\"id\":2,\"open_deg\":%d,\"close_deg\":%d,\"hold_ms\":%d,\"cycles_per_session\":%d,\"rest_ms\":%d,\"active_ms\":%d}"
+           "],"
            "\"sequence\":{\"open_deg\":%d,\"close_deg\":%d,\"hold_ms\":%d,\"cycles_per_session\":%d,\"rest_ms\":%d,\"active_ms\":%d}"
            "}",
            curAuto ? "auto" : "manual",
@@ -1140,7 +1217,9 @@ void handleApiStatus() {
            sSensorState,
            sCooldownSec,
            STANDALONE_EYES_MODE ? "true" : "false",
-           sOpen, sClose, sHold, sCycles, sRest, sActive);
+           sCfg[0].open_deg, sCfg[0].close_deg, sCfg[0].hold_ms, sCfg[0].cycles_per_session, sCfg[0].rest_ms, sCfg[0].active_duration_ms,
+           sCfg[1].open_deg, sCfg[1].close_deg, sCfg[1].hold_ms, sCfg[1].cycles_per_session, sCfg[1].rest_ms, sCfg[1].active_duration_ms,
+           sCfg[0].open_deg, sCfg[0].close_deg, sCfg[0].hold_ms, sCfg[0].cycles_per_session, sCfg[0].rest_ms, sCfg[0].active_duration_ms);
 
   server.send(200, "application/json", json);
 }
@@ -1492,6 +1571,16 @@ void handleApiSequence() {
     server.send(400, "application/json", "{\"error\":\"Missing sequence parameters\"}");
     return;
   }
+
+  int id = 0; // 0 = apply to both, 1 = Servo 1, 2 = Servo 2
+  if (server.hasArg("id")) {
+    id = server.arg("id").toInt();
+    if (id < 1 || id > 2) {
+      server.send(400, "application/json", "{\"error\":\"Parameter id must be 1 or 2\"}");
+      return;
+    }
+  }
+
   int open = server.arg("open_deg").toInt();
   int close = server.arg("close_deg").toInt();
   int hold = server.arg("hold_ms").toInt();
@@ -1509,7 +1598,8 @@ void handleApiSequence() {
     return;
   }
 
-  int cycles = seq_cycles_per_session;
+  int refIdx = (id >= 1) ? (id - 1) : 0;
+  int cycles = seq_configs[refIdx].cycles_per_session;
   if (server.hasArg("cycles_per_session")) {
     if (!parseStrictInt(server.arg("cycles_per_session"), 1, 100, cycles)) {
       server.send(400, "application/json", "{\"error\":\"Cycles per session must be an integer between 1 and 100\"}");
@@ -1517,7 +1607,7 @@ void handleApiSequence() {
     }
   }
 
-  int rest = seq_rest_ms;
+  int rest = seq_configs[refIdx].rest_ms;
   if (server.hasArg("rest_ms")) {
     if (!parseStrictInt(server.arg("rest_ms"), 0, 3600000, rest)) {
       server.send(400, "application/json", "{\"error\":\"Rest duration must be an integer between 0 and 3600000 ms\"}");
@@ -1525,7 +1615,7 @@ void handleApiSequence() {
     }
   }
 
-  int active = seq_active_duration_ms;
+  int active = seq_configs[refIdx].active_duration_ms;
   if (server.hasArg("active_ms")) {
     if (!parseStrictInt(server.arg("active_ms"), 1000, 3600000, active)) {
       server.send(400, "application/json", "{\"error\":\"Active duration must be an integer between 1000 and 3600000 ms\"}");
@@ -1539,34 +1629,70 @@ void handleApiSequence() {
   }
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  seq_open_deg = open;
-  seq_close_deg = close;
-  seq_hold_ms = hold;
-  seq_cycles_per_session = cycles;
-  seq_rest_ms = rest;
-  seq_active_duration_ms = active;
+  if (id == 1 || id == 2) {
+    seq_configs[id - 1].open_deg = open;
+    seq_configs[id - 1].close_deg = close;
+    seq_configs[id - 1].hold_ms = hold;
+    seq_configs[id - 1].cycles_per_session = cycles;
+    seq_configs[id - 1].rest_ms = rest;
+    seq_configs[id - 1].active_duration_ms = active;
+  } else {
+    for (int i = 0; i < 2; i++) {
+      seq_configs[i].open_deg = open;
+      seq_configs[i].close_deg = close;
+      seq_configs[i].hold_ms = hold;
+      seq_configs[i].cycles_per_session = cycles;
+      seq_configs[i].rest_ms = rest;
+      seq_configs[i].active_duration_ms = active;
+    }
+  }
   xSemaphoreGive(stateMutex);
 
-  // Restart active loops with new parameters immediately
-  restartServoSeq(0);
-  restartServoSeq(1);
+  // Restart active loop(s) with new parameters immediately
+  if (id == 1) {
+    restartServoSeq(0);
+  } else if (id == 2) {
+    restartServoSeq(1);
+  } else {
+    restartServoSeq(0);
+    restartServoSeq(1);
+  }
 
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleApiSequenceReset() {
   if (!checkMutationAuth()) return;
+  int id = 0;
+  if (server.hasArg("id")) {
+    id = server.arg("id").toInt();
+    if (id < 1 || id > 2) {
+      server.send(400, "application/json", "{\"error\":\"Parameter id must be 1 or 2\"}");
+      return;
+    }
+  }
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  seq_open_deg = DEFAULT_SEQ_OPEN_DEG;
-  seq_close_deg = DEFAULT_SEQ_CLOSE_DEG;
-  seq_hold_ms = DEFAULT_SEQ_HOLD_MS;
-  seq_cycles_per_session = DEFAULT_SEQ_CYCLES;
-  seq_rest_ms = DEFAULT_SEQ_REST_MS;
-  seq_active_duration_ms = DEFAULT_SEQ_ACTIVE_MS;
+  for (int i = 0; i < 2; i++) {
+    if (id == 0 || id == (i + 1)) {
+      seq_configs[i].open_deg = DEFAULT_SEQ_OPEN_DEG;
+      seq_configs[i].close_deg = DEFAULT_SEQ_CLOSE_DEG;
+      seq_configs[i].hold_ms = DEFAULT_SEQ_HOLD_MS;
+      seq_configs[i].cycles_per_session = DEFAULT_SEQ_CYCLES;
+      seq_configs[i].rest_ms = DEFAULT_SEQ_REST_MS;
+      seq_configs[i].active_duration_ms = (int)DEFAULT_SEQ_ACTIVE_MS;
+    }
+  }
   xSemaphoreGive(stateMutex);
 
-  restartServoSeq(0);
-  restartServoSeq(1);
+  if (id == 1) {
+    restartServoSeq(0);
+  } else if (id == 2) {
+    restartServoSeq(1);
+  } else {
+    restartServoSeq(0);
+    restartServoSeq(1);
+  }
 
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1574,19 +1700,19 @@ void handleApiSequenceReset() {
 void handleApiSequenceSave() {
   if (!checkMutationAuth()) return;
 
-  int open, close, hold, cycles, rest, active;
+  SequenceConfig localCfg[2];
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  open = seq_open_deg;
-  close = seq_close_deg;
-  hold = seq_hold_ms;
-  cycles = seq_cycles_per_session;
-  rest = seq_rest_ms;
-  active = seq_active_duration_ms;
+  for (int i = 0; i < 2; i++) {
+    localCfg[i] = seq_configs[i];
+  }
   xSemaphoreGive(stateMutex);
 
-  if (!isValidSequenceConfig(open, close, hold, cycles, rest, active)) {
-    server.send(400, "application/json", "{\"error\":\"Active sequence parameters are invalid\"}");
-    return;
+  for (int i = 0; i < 2; i++) {
+    if (!isValidSequenceConfig(localCfg[i].open_deg, localCfg[i].close_deg, localCfg[i].hold_ms,
+                                localCfg[i].cycles_per_session, localCfg[i].rest_ms, localCfg[i].active_duration_ms)) {
+      server.send(400, "application/json", "{\"error\":\"Active sequence parameters are invalid\"}");
+      return;
+    }
   }
 
   Preferences prefs;
@@ -1598,29 +1724,24 @@ void handleApiSequenceSave() {
   SequenceConfigBlob stored;
   memset(&stored, 0, sizeof(stored));
   size_t readBytes = prefs.getBytes("seqcfg", &stored, sizeof(stored));
-  if (readBytes == sizeof(stored) &&
-      stored.magic == SEQ_CONFIG_MAGIC &&
-      stored.version == SEQ_CONFIG_VERSION &&
-      stored.open_deg == (int16_t)open &&
-      stored.close_deg == (int16_t)close &&
-      stored.cycles_per_session == (int16_t)cycles &&
-      stored.hold_ms == (int32_t)hold &&
-      stored.rest_ms == (int32_t)rest &&
-      stored.active_ms == (int32_t)active) {
-    prefs.end();
-    server.send(200, "application/json", "{\"ok\":true,\"saved\":false,\"message\":\"Unchanged\"}");
-    return;
-  }
 
   SequenceConfigBlob toWrite;
   toWrite.magic = SEQ_CONFIG_MAGIC;
   toWrite.version = SEQ_CONFIG_VERSION;
-  toWrite.open_deg = (int16_t)open;
-  toWrite.close_deg = (int16_t)close;
-  toWrite.cycles_per_session = (int16_t)cycles;
-  toWrite.hold_ms = (int32_t)hold;
-  toWrite.rest_ms = (int32_t)rest;
-  toWrite.active_ms = (int32_t)active;
+  for (int i = 0; i < 2; i++) {
+    toWrite.servos[i].open_deg = (int16_t)localCfg[i].open_deg;
+    toWrite.servos[i].close_deg = (int16_t)localCfg[i].close_deg;
+    toWrite.servos[i].cycles_per_session = (int16_t)localCfg[i].cycles_per_session;
+    toWrite.servos[i].hold_ms = (int32_t)localCfg[i].hold_ms;
+    toWrite.servos[i].rest_ms = (int32_t)localCfg[i].rest_ms;
+    toWrite.servos[i].active_ms = (int32_t)localCfg[i].active_duration_ms;
+  }
+
+  if (readBytes == sizeof(toWrite) && memcmp(&stored, &toWrite, sizeof(toWrite)) == 0) {
+    prefs.end();
+    server.send(200, "application/json", "{\"ok\":true,\"saved\":false,\"message\":\"Unchanged\"}");
+    return;
+  }
 
   size_t written = prefs.putBytes("seqcfg", &toWrite, sizeof(toWrite));
   prefs.end();

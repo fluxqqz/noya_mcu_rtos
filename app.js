@@ -123,7 +123,10 @@ function getSequenceSaveStatus(state, pendingSet, isFilePreview) {
   if (isSequenceActionBusy(pendingSet)) {
     return { allowed: false, reason: 'busy', error: 'Sequence operation in progress' };
   }
-  if (state.sequenceDirty) {
+  const isDirty = (typeof state.sequenceDirty === 'object')
+    ? (state.sequenceDirty[1] || state.sequenceDirty[2])
+    : Boolean(state.sequenceDirty);
+  if (isDirty) {
     return {
       allowed: false,
       reason: 'dirty',
@@ -179,12 +182,28 @@ function serializeFormUrlEncoded(data) {
  * Creates a clean default application state object.
  */
 function createAppState(initial = {}) {
-  return {
+  const state = {
     connected: false,
     mode: 'manual', // 'manual' | 'auto'
     paused: false,
     eyeMode: false,
-    config: { ...DEFAULT_CONFIG },
+    activeSeqTab: 1,
+    config: {
+      1: { ...DEFAULT_CONFIG },
+      2: { ...DEFAULT_CONFIG },
+      get openAngle() { return this[state.activeSeqTab || 1].openAngle; },
+      set openAngle(v) { this[state.activeSeqTab || 1].openAngle = v; },
+      get closeAngle() { return this[state.activeSeqTab || 1].closeAngle; },
+      set closeAngle(v) { this[state.activeSeqTab || 1].closeAngle = v; },
+      get holdMs() { return this[state.activeSeqTab || 1].holdMs; },
+      set holdMs(v) { this[state.activeSeqTab || 1].holdMs = v; },
+      get cyclesPerSession() { return this[state.activeSeqTab || 1].cyclesPerSession; },
+      set cyclesPerSession(v) { this[state.activeSeqTab || 1].cyclesPerSession = v; },
+      get restMs() { return this[state.activeSeqTab || 1].restMs; },
+      set restMs(v) { this[state.activeSeqTab || 1].restMs = v; },
+      get activeMs() { return this[state.activeSeqTab || 1].activeMs; },
+      set activeMs(v) { this[state.activeSeqTab || 1].activeMs = v; },
+    },
     sensor: {
       enabled: false,
       raw: 0,
@@ -193,7 +212,10 @@ function createAppState(initial = {}) {
       state: 'IDLE',
       cooldownSec: 0,
     },
-    sequenceDirty: false,
+    sequenceDirty: {
+      1: false,
+      2: false,
+    },
     servos: {
       1: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', cycle: 0, restRemainingMs: 0, attached: true, timer: null, presets: [...DEFAULT_PRESETS] },
       2: { angle: 30, running: false, phase: 'idle', statusText: 'IDLE', cycle: 0, restRemainingMs: 0, attached: true, timer: null, presets: [...DEFAULT_PRESETS] },
@@ -215,6 +237,7 @@ function createAppState(initial = {}) {
     lastError: null,
     ...initial,
   };
+  return state;
 }
 
 /**
@@ -266,19 +289,33 @@ function applyStatusToState(state, data) {
     });
   }
 
-  if (data.sequence && typeof data.sequence === 'object') {
-    state.config.openAngle = data.sequence.open_deg;
-    state.config.closeAngle = data.sequence.close_deg;
-    state.config.holdMs = data.sequence.hold_ms;
-    if (data.sequence.cycles_per_session !== undefined) {
-      state.config.cyclesPerSession = data.sequence.cycles_per_session;
-    }
-    if (data.sequence.rest_ms !== undefined) {
-      state.config.restMs = data.sequence.rest_ms;
-    }
-    if (data.sequence.active_ms !== undefined) {
-      state.config.activeMs = data.sequence.active_ms;
-    }
+  if (Array.isArray(data.sequences)) {
+    data.sequences.forEach((seq) => {
+      if (seq && (seq.id === 1 || seq.id === 2)) {
+        const id = seq.id;
+        state.config[id].openAngle = seq.open_deg;
+        state.config[id].closeAngle = seq.close_deg;
+        state.config[id].holdMs = seq.hold_ms;
+        if (seq.cycles_per_session !== undefined) state.config[id].cyclesPerSession = seq.cycles_per_session;
+        if (seq.rest_ms !== undefined) state.config[id].restMs = seq.rest_ms;
+        if (seq.active_ms !== undefined) state.config[id].activeMs = seq.active_ms;
+      }
+    });
+  } else if (data.sequence && typeof data.sequence === 'object') {
+    [1, 2].forEach((id) => {
+      state.config[id].openAngle = data.sequence.open_deg;
+      state.config[id].closeAngle = data.sequence.close_deg;
+      state.config[id].holdMs = data.sequence.hold_ms;
+      if (data.sequence.cycles_per_session !== undefined) {
+        state.config[id].cyclesPerSession = data.sequence.cycles_per_session;
+      }
+      if (data.sequence.rest_ms !== undefined) {
+        state.config[id].restMs = data.sequence.rest_ms;
+      }
+      if (data.sequence.active_ms !== undefined) {
+        state.config[id].activeMs = data.sequence.active_ms;
+      }
+    });
   }
 
   if (data.sensor && typeof data.sensor === 'object') {
@@ -535,6 +572,8 @@ if (typeof window !== 'undefined') {
       sensorBadge: document.getElementById('sensor-badge'),
 
       settingsForm: document.getElementById('settings-form'),
+      tabSeq1: document.getElementById('tab-seq-1'),
+      tabSeq2: document.getElementById('tab-seq-2'),
       fieldCycles: document.getElementById('field-cycles'),
       fieldActive: document.getElementById('field-active'),
       cfgOpen: document.getElementById('cfg-open'),
@@ -833,35 +872,63 @@ if (typeof window !== 'undefined') {
       }
     }
 
-    function syncSettingsFromStatus(seq) {
-      if (!seq || typeof seq !== 'object') return;
-      state.config.openAngle = seq.open_deg;
-      state.config.closeAngle = seq.close_deg;
-      state.config.holdMs = seq.hold_ms;
-      if (seq.cycles_per_session !== undefined) state.config.cyclesPerSession = seq.cycles_per_session;
-      if (seq.rest_ms !== undefined) state.config.restMs = seq.rest_ms;
-      if (seq.active_ms !== undefined) state.config.activeMs = seq.active_ms;
-
+    function populateSettingsFormInputs() {
+      const activeId = state.activeSeqTab || 1;
+      const cfg = state.config[activeId] || DEFAULT_CONFIG;
       const isFocused = document.activeElement === dom.cfgOpen ||
                         document.activeElement === dom.cfgClose ||
                         document.activeElement === dom.cfgHold ||
                         document.activeElement === dom.cfgCycles ||
                         document.activeElement === dom.cfgActive ||
                         document.activeElement === dom.cfgRest;
-      if (!isFocused && !state.sequenceDirty) {
-        dom.cfgOpen.value = seq.open_deg;
-        dom.cfgClose.value = seq.close_deg;
-        dom.cfgHold.value = seq.hold_ms;
-        if (dom.cfgCycles && seq.cycles_per_session !== undefined) {
-          dom.cfgCycles.value = seq.cycles_per_session;
+      const isDirty = (typeof state.sequenceDirty === 'object')
+        ? Boolean(state.sequenceDirty[activeId])
+        : Boolean(state.sequenceDirty);
+
+      if (!isFocused && !isDirty) {
+        dom.cfgOpen.value = cfg.openAngle;
+        dom.cfgClose.value = cfg.closeAngle;
+        dom.cfgHold.value = cfg.holdMs;
+        if (dom.cfgCycles && cfg.cyclesPerSession !== undefined) {
+          dom.cfgCycles.value = cfg.cyclesPerSession;
         }
-        if (dom.cfgActive && seq.active_ms !== undefined) {
-          dom.cfgActive.value = seq.active_ms / 1000;
+        if (dom.cfgActive && cfg.activeMs !== undefined) {
+          dom.cfgActive.value = cfg.activeMs / 1000;
         }
-        if (dom.cfgRest && seq.rest_ms !== undefined) {
-          dom.cfgRest.value = seq.rest_ms / 1000;
+        if (dom.cfgRest && cfg.restMs !== undefined) {
+          dom.cfgRest.value = cfg.restMs / 1000;
         }
       }
+    }
+
+    function selectSeqTab(servoId) {
+      if (servoId !== 1 && servoId !== 2) return;
+      state.activeSeqTab = servoId;
+      if (dom.tabSeq1) {
+        dom.tabSeq1.classList.toggle('active', servoId === 1);
+        dom.tabSeq1.setAttribute('aria-selected', String(servoId === 1));
+      }
+      if (dom.tabSeq2) {
+        dom.tabSeq2.classList.toggle('active', servoId === 2);
+        dom.tabSeq2.setAttribute('aria-selected', String(servoId === 2));
+      }
+      populateSettingsFormInputs();
+    }
+
+    function updateSeqTabLabels() {
+      if (!dom.tabSeq1 || !dom.tabSeq2) return;
+      if (state.eyeMode) {
+        dom.tabSeq1.textContent = 'Servo 1 (Eyelid 1)';
+        dom.tabSeq2.textContent = 'Servo 2 (Eyelid 2)';
+      } else {
+        dom.tabSeq1.textContent = 'Servo 1 (Mouth 1)';
+        dom.tabSeq2.textContent = 'Servo 2 (Mouth 2)';
+      }
+    }
+
+    function syncSettingsFromStatus(seq) {
+      updateSeqTabLabels();
+      populateSettingsFormInputs();
     }
 
     function updateDeviceInfoUI(data) {
@@ -1332,9 +1399,22 @@ if (typeof window !== 'undefined') {
     dom.relay1Toggle.addEventListener('change', (e) => handleRelayToggle(1, e.target.checked));
     dom.relay2Toggle.addEventListener('change', (e) => handleRelayToggle(2, e.target.checked));
 
+    if (dom.tabSeq1) {
+      dom.tabSeq1.addEventListener('click', () => selectSeqTab(1));
+    }
+    if (dom.tabSeq2) {
+      dom.tabSeq2.addEventListener('click', () => selectSeqTab(2));
+    }
+
     // Sequence Settings Form Dirty Tracking
     [dom.cfgOpen, dom.cfgClose, dom.cfgHold, dom.cfgCycles, dom.cfgActive, dom.cfgRest].forEach((el) => {
-      if (el) el.addEventListener('input', () => { state.sequenceDirty = true; });
+      if (el) el.addEventListener('input', () => {
+        if (typeof state.sequenceDirty === 'object') {
+          state.sequenceDirty[state.activeSeqTab || 1] = true;
+        } else {
+          state.sequenceDirty = true;
+        }
+      });
     });
 
     // Sequence Settings Form Submit (RAM Apply)
@@ -1342,6 +1422,7 @@ if (typeof window !== 'undefined') {
       e.preventDefault();
       if (!state.connected || isSettingsBusy()) return;
 
+      const activeId = state.activeSeqTab || 1;
       const candidate = {
         openAngle: dom.cfgOpen.value.trim(),
         closeAngle: dom.cfgClose.value.trim(),
@@ -1359,21 +1440,24 @@ if (typeof window !== 'undefined') {
       }
 
       if (isFilePreview) {
-        state.config = result.values;
-        state.sequenceDirty = false;
+        state.config[activeId] = result.values;
+        if (typeof state.sequenceDirty === 'object') {
+          state.sequenceDirty[activeId] = false;
+        } else {
+          state.sequenceDirty = false;
+        }
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Sequence parameters applied to simulation.';
-        [1, 2].forEach((id) => {
-          if (state.servos[id].running && !state.paused) {
-            startServoSim(id);
-          }
-        });
+        dom.settingsFeedback.textContent = `Sequence parameters applied for Servo ${activeId} in simulation.`;
+        if (state.servos[activeId].running && !state.paused) {
+          startServoSim(activeId);
+        }
         updateStatusBar();
         return;
       }
 
       // Live HTTP POST /api/sequence
       const payload = {
+        id: activeId,
         open_deg: result.values.openAngle,
         close_deg: result.values.closeAngle,
         hold_ms: result.values.holdMs,
@@ -1387,10 +1471,14 @@ if (typeof window !== 'undefined') {
       const res = await executeApiPost('/api/sequence', payload, 'sequence');
 
       if (res.ok) {
-        state.config = result.values;
-        state.sequenceDirty = false;
+        state.config[activeId] = result.values;
+        if (typeof state.sequenceDirty === 'object') {
+          state.sequenceDirty[activeId] = false;
+        } else {
+          state.sequenceDirty = false;
+        }
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Sequence parameters applied in RAM. Active loops restarted.';
+        dom.settingsFeedback.textContent = `Sequence parameters applied for Servo ${activeId} in RAM.`;
       } else {
         dom.settingsFeedback.className = 'feedback-msg feedback-error';
         dom.settingsFeedback.textContent = res.error || 'Failed to apply sequence parameters.';
@@ -1400,40 +1488,37 @@ if (typeof window !== 'undefined') {
     // Sequence Settings Reset Defaults (RAM)
     dom.btnResetSettings.addEventListener('click', async () => {
       if (!state.connected || isSettingsBusy()) return;
+      const activeId = state.activeSeqTab || 1;
 
       if (isFilePreview) {
-        state.config = { ...DEFAULT_CONFIG };
-        state.sequenceDirty = false;
-        dom.cfgOpen.value = DEFAULT_CONFIG.openAngle;
-        dom.cfgClose.value = DEFAULT_CONFIG.closeAngle;
-        dom.cfgHold.value = DEFAULT_CONFIG.holdMs;
-        if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
-        if (dom.cfgActive) dom.cfgActive.value = DEFAULT_CONFIG.activeMs / 1000;
-        if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
+        state.config[activeId] = { ...DEFAULT_CONFIG };
+        if (typeof state.sequenceDirty === 'object') {
+          state.sequenceDirty[activeId] = false;
+        } else {
+          state.sequenceDirty = false;
+        }
+        populateSettingsFormInputs();
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Factory defaults restored in simulation.';
-        [1, 2].forEach((id) => {
-          if (state.servos[id].running && !state.paused) {
-            startServoSim(id);
-          }
-        });
+        dom.settingsFeedback.textContent = `Factory defaults restored for Servo ${activeId} in simulation.`;
+        if (state.servos[activeId].running && !state.paused) {
+          startServoSim(activeId);
+        }
         updateStatusBar();
         return;
       }
 
-      // Live HTTP POST /api/sequence/reset
-      const res = await executeApiPost('/api/sequence/reset', {}, 'sequence_reset');
+      // Live HTTP POST /api/sequence/reset with id
+      const res = await executeApiPost('/api/sequence/reset', { id: activeId }, 'sequence_reset');
       if (res.ok) {
-        state.config = { ...DEFAULT_CONFIG };
-        state.sequenceDirty = false;
-        dom.cfgOpen.value = DEFAULT_CONFIG.openAngle;
-        dom.cfgClose.value = DEFAULT_CONFIG.closeAngle;
-        dom.cfgHold.value = DEFAULT_CONFIG.holdMs;
-        if (dom.cfgCycles) dom.cfgCycles.value = DEFAULT_CONFIG.cyclesPerSession;
-        if (dom.cfgActive) dom.cfgActive.value = DEFAULT_CONFIG.activeMs / 1000;
-        if (dom.cfgRest) dom.cfgRest.value = DEFAULT_CONFIG.restMs / 1000;
+        state.config[activeId] = { ...DEFAULT_CONFIG };
+        if (typeof state.sequenceDirty === 'object') {
+          state.sequenceDirty[activeId] = false;
+        } else {
+          state.sequenceDirty = false;
+        }
+        populateSettingsFormInputs();
         dom.settingsFeedback.className = 'feedback-msg feedback-success';
-        dom.settingsFeedback.textContent = 'Factory defaults restored in RAM. Click Save to Device to persist.';
+        dom.settingsFeedback.textContent = `Factory defaults restored for Servo ${activeId} in RAM. Click Save to Device to persist.`;
       } else {
         dom.settingsFeedback.className = 'feedback-msg feedback-error';
         dom.settingsFeedback.textContent = res.error || 'Failed to reset sequence defaults.';
@@ -1632,6 +1717,10 @@ async function runSelfTest() {
     ],
     relays: [{ id: 1, state: 1 }, { id: 2, state: 0 }],
     sensor: { enabled: true, raw: 345, threshold: 200, detected: true, state: 'ACTIVE', cooldown_sec: 0 },
+    sequences: [
+      { id: 1, open_deg: 40, close_deg: 90, hold_ms: 300, cycles_per_session: 8, rest_ms: 15000, active_ms: 60000 },
+      { id: 2, open_deg: 25, close_deg: 75, hold_ms: 150, cycles_per_session: 4, rest_ms: 10000, active_ms: 45000 },
+    ],
     sequence: { open_deg: 40, close_deg: 90, hold_ms: 300, cycles_per_session: 8, rest_ms: 15000 },
   };
 
@@ -1646,8 +1735,10 @@ async function runSelfTest() {
   assert(mockState.relays[1] === true && mockState.relays[2] === false, 'Relays parsed');
   assert(mockState.sensor.raw === 345 && mockState.sensor.detected === true, 'Sensor telemetry parsed');
   assert(mockState.sensor.state === 'ACTIVE', 'Sensor state parsed');
-  assert(mockState.config.openAngle === 40 && mockState.config.holdMs === 300, 'Sequence config parsed');
-  assert(mockState.config.cyclesPerSession === 8 && mockState.config.restMs === 15000, 'Cycles and rest config parsed');
+  assert(mockState.config[1].openAngle === 40 && mockState.config[1].holdMs === 300, 'Servo 1 sequence config parsed');
+  assert(mockState.config[2].openAngle === 25 && mockState.config[2].holdMs === 150, 'Servo 2 sequence config parsed');
+  assert(mockState.config.openAngle === 40, 'Active tab property forwarder works');
+  assert(mockState.config[1].cyclesPerSession === 8 && mockState.config[1].restMs === 15000, 'Cycles and rest config parsed');
 
   // Conservative attached mapping verification
   const detachedPayload = {
@@ -2188,6 +2279,8 @@ async function runSelfTest() {
         'sensor-state-text',
         'sensor-badge',
         'details-settings',
+        'tab-seq-1',
+        'tab-seq-2',
         'settings-form',
         'cfg-open',
         'cfg-close',
