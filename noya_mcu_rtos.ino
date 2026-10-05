@@ -23,7 +23,7 @@
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
 // Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
 #ifndef SLAVE_INDEX
-#define SLAVE_INDEX 4
+#define SLAVE_INDEX 5
 #endif
 
 #if STANDALONE_EYES_MODE
@@ -52,7 +52,7 @@ typedef struct __attribute__((packed)) {
 
 // ─── SENSOR INTERACTION PARAMETERS (PLANT MODE) ──────────────────────────────
 #ifndef IS_SENSOR
-const bool     IS_SENSOR                 = true;   // Enable the sensor background task
+const bool     IS_SENSOR                 = false;   // Enable the sensor background task
 #endif
 const int      SENSOR_PIN                = 6;      // Sensor ADC input pin (GPIO 6)
 const int      SENSOR_THRESHOLD          = 1800;    // Trigger threshold (ADC 0..4095)
@@ -308,32 +308,33 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
       xSemaphoreGive(stateMutex);
       return;
     }
+    anim_cmd_id[idx] = cmd.cmd_id;
 
-    anim_cmd_id[idx]      = cmd.cmd_id;
-    anim_open_deg[idx]    = open_deg;
-    anim_close_deg[idx]   = close_deg;
-    anim_deadline_ms[idx] = millis() + cmd.duration_ms;
-    anim_active[idx]      = true;
+    if (cmd.duration_ms == 0) {
+      // STOP command from Master: stop sequence, return to open, and power down relay
+      anim_active[idx] = false;
+      xSemaphoreGive(stateMutex);
+      stopServoSeq(idx, true);
+      Serial.printf("[ESP-NOW] Stop Cmd #%u: Mouth %d\n", cmd.cmd_id, idx + 1);
+      return;
+    }
 
-    // Preempt active motion / pause; worker task will interpolate from last_actual_pulse_us
-    servoEpoch[idx]++;
-    servo_running[idx]    = true;
+    // START command from Master: configure angles and run autonomous sequence loop
+    if (open_deg != close_deg) {
+      seq_configs[idx].open_deg = open_deg;
+      seq_configs[idx].close_deg = close_deg;
+    }
+    anim_active[idx] = false;
     explicit_stopped[idx] = false;
-    servo_cycle[idx]      = 1;
-    servo_rest_until[idx] = 0;
-
-    strncpy(servo_status_str[idx], "ANIMATING", sizeof(servo_status_str[idx]) - 1);
-    servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
-    strncpy(servo_phase_str[idx], "active", sizeof(servo_phase_str[idx]) - 1);
-    servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
-
-    QueueHandle_t q = (idx == 0) ? servoQueue1 : servoQueue2;
-    if (q) xQueueReset(q);
-
+    bool alreadyRunning = servo_running[idx] && !isPaused;
     xSemaphoreGive(stateMutex);
 
-    Serial.printf("[ESP-NOW] Accepted Cmd #%u: Mouth %d, Open:%d Close:%d Dur:%ums\n",
-                  cmd.cmd_id, idx + 1, open_deg, close_deg, cmd.duration_ms);
+    if (!alreadyRunning) {
+      startServoSeq(idx);
+    }
+
+    Serial.printf("[ESP-NOW] Start Cmd #%u: Mouth %d, Open:%d Close:%d (Autonomous loop)\n",
+                  cmd.cmd_id, idx + 1, open_deg, close_deg);
   }
 }
 
