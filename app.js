@@ -520,6 +520,7 @@ if (typeof window !== 'undefined') {
 
       btnVisualizerLink: document.getElementById('btn-visualizer-link'),
       visualizerDeviceLink: document.getElementById('visualizer-device-link'),
+      headerMdns: document.getElementById('header-mdns'),
       btnModeManual: document.getElementById('btn-mode-manual'),
       btnModeAuto: document.getElementById('btn-mode-auto'),
       btnPauseSim: document.getElementById('btn-pause-sim'),
@@ -933,12 +934,17 @@ if (typeof window !== 'undefined') {
 
     function updateDeviceInfoUI(data) {
       if (!data) return;
+      const host = data.mdns || 'mcu-eye-monster';
+      if (dom.headerMdns) dom.headerMdns.textContent = `${host}.local`;
+      if (typeof document !== 'undefined') {
+        document.title = `${host}.local — NOYA Control Panel`;
+      }
       if (dom.infoChip) dom.infoChip.textContent = data.chip_model || 'ESP32 RTOS';
       if (dom.infoUptime) dom.infoUptime.textContent = formatUptime(data.uptime);
       if (dom.infoHeap) dom.infoHeap.textContent = `${Number(data.free_heap || 0).toLocaleString()} bytes`;
       if (dom.infoSta) dom.infoSta.textContent = `${data.sta_ip || 'disconnected'} (${data.wifi_connected ? 'Connected' : 'Disconnected'})`;
       if (dom.infoAp) dom.infoAp.textContent = data.ap_ip || '192.168.10.1';
-      if (dom.infoMdns) dom.infoMdns.textContent = `http://${data.mdns || 'mcu-eye-monster'}.local`;
+      if (dom.infoMdns) dom.infoMdns.textContent = `http://${host}.local`;
       if (dom.infoConnMode) dom.infoConnMode.textContent = isFilePreview ? 'Offline preview (file:// protocol)' : 'Live Hardware (HTTP Polling: 1s)';
     }
 
@@ -2227,6 +2233,7 @@ async function runSelfTest() {
         'app-alert-text',
         'app-alert-dismiss',
         'demo-banner',
+        'header-mdns',
         'btn-visualizer-link',
         'btn-mode-manual',
         'btn-mode-auto',

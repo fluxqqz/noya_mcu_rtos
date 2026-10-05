@@ -154,12 +154,31 @@ body {
   margin-bottom: 1.25rem;
 }
 
+.brand-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
 .brand-title {
   font-size: 1.625rem;
   font-weight: 800;
   letter-spacing: 0.08em;
   color: var(--navy-900);
   line-height: 1.1;
+}
+
+.badge-mdns {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.2rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background-color: #f1f5f9;
+  color: var(--teal-700);
+  border: 1px solid var(--border-color);
+  letter-spacing: normal;
 }
 
 .brand-subtitle {
