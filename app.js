@@ -14,7 +14,7 @@ const DEFAULT_CONFIG = Object.freeze({
   activeMs: 60000,
 });
 
-const DEFAULT_PRESETS = Object.freeze([30, 85]);
+const DEFAULT_PRESETS = Object.freeze([50, 100]);
 
 /**
  * Validates sequence parameters.
@@ -277,6 +277,9 @@ function applyStatusToState(state, data) {
         state.servos[s.id].statusText = s.status || '';
         state.servos[s.id].cycle = Number(s.cycle) || 0;
         state.servos[s.id].restRemainingMs = Number(s.rest_remaining_ms) || 0;
+        if (Array.isArray(s.presets) && s.presets.length >= 2) {
+          state.servos[s.id].presets = [Number(s.presets[0]), Number(s.presets[1])];
+        }
       }
     });
   }
@@ -654,6 +657,17 @@ if (typeof window !== 'undefined') {
       const pulseElem = isS1 ? dom.servo1Pulse : dom.servo2Pulse;
       const pulseUs = s.pulse_us || Math.round(500 + (s.angle / 180) * 2000);
       if (pulseElem) pulseElem.textContent = `${pulseUs} µs`;
+
+      const p1Btn = isS1 ? dom.servo1Preset1Btn : dom.servo2Preset1Btn;
+      const p2Btn = isS1 ? dom.servo1Preset2Btn : dom.servo2Preset2Btn;
+      const pVal1 = isS1 ? dom.servo1PresetVal1 : dom.servo2PresetVal1;
+      const pVal2 = isS1 ? dom.servo1PresetVal2 : dom.servo2PresetVal2;
+      if (Array.isArray(s.presets) && s.presets.length >= 2) {
+        if (p1Btn) p1Btn.textContent = `Move to ${s.presets[0]}°`;
+        if (p2Btn) p2Btn.textContent = `Move to ${s.presets[1]}°`;
+        if (pVal1 && document.activeElement !== pVal1) pVal1.value = s.presets[0];
+        if (pVal2 && document.activeElement !== pVal2) pVal2.value = s.presets[1];
+      }
 
       // Avoid overwriting focused or actively edited angle inputs
       if (document.activeElement !== sliderElem) {
@@ -1671,7 +1685,7 @@ async function runSelfTest() {
   assert(!validateServoAngle('1e2').valid, 'Scientific notation rejected');
 
   // 3. Presets
-  assert(DEFAULT_PRESETS.length === 2 && DEFAULT_PRESETS[0] === 30 && DEFAULT_PRESETS[1] === 85, 'Default presets are 30 and 85');
+  assert(DEFAULT_PRESETS.length === 2 && DEFAULT_PRESETS[0] === 50 && DEFAULT_PRESETS[1] === 100, 'Default presets are 50 and 100');
   assert(validateServoAngle(DEFAULT_PRESETS[0]).valid && validateServoAngle(DEFAULT_PRESETS[1]).valid, 'Default presets valid');
 
   // 4. Form UrlEncoding Serializer

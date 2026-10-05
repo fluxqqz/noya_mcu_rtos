@@ -11,7 +11,7 @@ const DEFAULT_CONFIG = Object.freeze({
   holdMs: 200,
 });
 
-const DEFAULT_PRESETS = Object.freeze([30, 85]);
+const DEFAULT_PRESETS = Object.freeze([50, 100]);
 
 /**
  * Validates sequence parameters.
@@ -637,7 +637,7 @@ function runSelfTest() {
   assert(!validateServoAngle('1e2').valid, 'Scientific notation string rejected');
 
   // 3. Preset validation & independent defaults test cases
-  assert(DEFAULT_PRESETS.length === 2 && DEFAULT_PRESETS[0] === 30 && DEFAULT_PRESETS[1] === 85, 'Default presets are 30 and 85');
+  assert(DEFAULT_PRESETS.length === 2 && DEFAULT_PRESETS[0] === 50 && DEFAULT_PRESETS[1] === 100, 'Default presets are 50 and 100');
   assert(validateServoAngle(DEFAULT_PRESETS[0]).valid && validateServoAngle(DEFAULT_PRESETS[1]).valid, 'Default preset angles must validate');
   assert(!validateServoAngle(-1).valid, 'Negative preset angle rejected');
   assert(!validateServoAngle(181).valid, 'Preset angle > 180 rejected');

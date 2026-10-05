@@ -93,9 +93,16 @@ const int START_DEG = 50;
 // Holding torque timeout for manual commands
 const uint32_t MANUAL_SERVO_HOLD_MS = 60000;
 
+// Default manual angle presets for dashboard buttons (Servo 1 and Servo 2)
+const int DEFAULT_SERVO_PRESETS[2][2] = {
+  { 50, 100 }, // Servo 1: Preset 1, Preset 2
+  { 50, 100 }  // Servo 2: Preset 1, Preset 2
+};
+
 // ─── RTOS TASK QUEUES & SYNCHRONIZATION ───────────────────────────────────────
 enum ServoCmdType {
-  CMD_SET_ANGLE
+  CMD_SET_ANGLE,
+  CMD_PARK_AND_STOP
 };
 
 enum class MotionProfile {
@@ -109,10 +116,12 @@ struct ServoCommand {
   uint32_t epoch;
 };
 
-// Forward declaration with defaults for moveServo
+// Forward declarations
 void moveServo(int setpoint_deg, Servo& servo, int servoIndex, uint32_t token,
                MotionProfile profile = MotionProfile::Exponential,
                uint32_t durationMs = 1000);
+void stopServoSeq(int index, bool explicitStop, bool graceful = true);
+void startServoSeq(int index);
 
 static QueueHandle_t servoQueue1 = NULL;
 static QueueHandle_t servoQueue2 = NULL;
@@ -433,32 +442,45 @@ void startServoSeq(int index) {
   xSemaphoreGive(stateMutex);
 }
 
-void stopServoSeq(int index, bool explicitStop) {
+void stopServoSeq(int index, bool explicitStop, bool graceful) {
   if (index < 0 || index >= 2) return;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   if (explicitStop) {
     explicit_stopped[index] = true;
   }
-  if (servo_running[index] || explicitStop) {
-    servoEpoch[index]++;
-  }
+  uint32_t token = ++servoEpoch[index];
   servo_running[index] = false;
   anim_active[index] = false;
   servo_cycle[index] = 0;
   servo_rest_until[index] = 0;
-  strncpy(servo_phase_str[index], "idle", sizeof(servo_phase_str[index]) - 1);
-  servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
-  // ponytail: preserve DETACHED status on stop
-  if (!servo_attached[index]) {
-    strncpy(servo_status_str[index], "DETACHED", sizeof(servo_status_str[index]) - 1);
-  } else {
-    strncpy(servo_status_str[index], "IDLE", sizeof(servo_status_str[index]) - 1);
-  }
-  servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
+
   QueueHandle_t q = (index == 0) ? servoQueue1 : servoQueue2;
   if (q) xQueueReset(q);
-  xSemaphoreGive(stateMutex);
-  setServoPower(index, false);
+
+  if (graceful && servo_attached[index] && !isPaused) {
+    strncpy(servo_phase_str[index], "open", sizeof(servo_phase_str[index]) - 1);
+    servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
+    strncpy(servo_status_str[index], "PARKING", sizeof(servo_status_str[index]) - 1);
+    servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
+    commanded_angles[index] = seq_configs[index].open_deg;
+    if (q) {
+      ServoCommand cmd = { CMD_PARK_AND_STOP, seq_configs[index].open_deg, token };
+      xQueueSend(q, &cmd, 0);
+    }
+    xSemaphoreGive(stateMutex);
+  } else {
+    strncpy(servo_phase_str[index], "idle", sizeof(servo_phase_str[index]) - 1);
+    servo_phase_str[index][sizeof(servo_phase_str[index]) - 1] = '\0';
+    // ponytail: preserve DETACHED status on stop
+    if (!servo_attached[index]) {
+      strncpy(servo_status_str[index], "DETACHED", sizeof(servo_status_str[index]) - 1);
+    } else {
+      strncpy(servo_status_str[index], "IDLE", sizeof(servo_status_str[index]) - 1);
+    }
+    servo_status_str[index][sizeof(servo_status_str[index]) - 1] = '\0';
+    xSemaphoreGive(stateMutex);
+    setServoPower(index, false);
+  }
 }
 
 void restartServoSeq(int index) {
@@ -694,9 +716,14 @@ void servoWorkerTask(void* pvParameters) {
           commanded_angles[idx] = cmd.angle;
           servo_cycle[idx] = 0;
           servo_rest_until[idx] = 0;
-          strncpy(servo_status_str[idx], "MANUAL SET", sizeof(servo_status_str[idx]) - 1);
+          if (cmd.type == CMD_PARK_AND_STOP) {
+            strncpy(servo_status_str[idx], "PARKING", sizeof(servo_status_str[idx]) - 1);
+            strncpy(servo_phase_str[idx], "open", sizeof(servo_phase_str[idx]) - 1);
+          } else {
+            strncpy(servo_status_str[idx], "MANUAL SET", sizeof(servo_status_str[idx]) - 1);
+            strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
+          }
           servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
-          strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
           servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
           hasCmd = true;
         }
@@ -714,6 +741,8 @@ void servoWorkerTask(void* pvParameters) {
         if (servo_attached[idx]) {
           strncpy(servo_status_str[idx], "IDLE", sizeof(servo_status_str[idx]) - 1);
           servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
+          strncpy(servo_phase_str[idx], "idle", sizeof(servo_phase_str[idx]) - 1);
+          servo_phase_str[idx][sizeof(servo_phase_str[idx]) - 1] = '\0';
         } else {
           strncpy(servo_status_str[idx], "DETACHED", sizeof(servo_status_str[idx]) - 1);
           servo_status_str[idx][sizeof(servo_status_str[idx]) - 1] = '\0';
@@ -721,10 +750,17 @@ void servoWorkerTask(void* pvParameters) {
       }
       xSemaphoreGive(stateMutex);
 
-      // Hold position with active power for MANUAL_SERVO_HOLD_MS, then power down if no further commands arrive
-      if (q == NULL || uxQueueMessagesWaiting(q) == 0) {
-        if (waitEpochDelay(idx, token, MANUAL_SERVO_HOLD_MS)) {
+      if (cmd.type == CMD_PARK_AND_STOP) {
+        // Settle 500ms into rest open position, then power down immediately
+        if (waitEpochDelay(idx, token, 500)) {
           setServoPower(idx, false);
+        }
+      } else {
+        // Hold position with active power for MANUAL_SERVO_HOLD_MS, then power down if no further commands arrive
+        if (q == NULL || uxQueueMessagesWaiting(q) == 0) {
+          if (waitEpochDelay(idx, token, MANUAL_SERVO_HOLD_MS)) {
+            setServoPower(idx, false);
+          }
         }
       }
     }
@@ -1183,8 +1219,8 @@ void handleApiStatus() {
            "\"mdns\":\"%s\","
            "\"ota_auth\":\"none (preexisting limitation)\","
            "\"servos\":["
-           "{\"id\":1,\"pin\":%d,\"name\":\"Servo 1\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
-           "{\"id\":2,\"pin\":%d,\"name\":\"Servo 2\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s},"
+           "{\"id\":1,\"pin\":%d,\"name\":\"Servo 1\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s,\"presets\":[%d,%d]},"
+           "{\"id\":2,\"pin\":%d,\"name\":\"Servo 2\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":true,\"running\":%s,\"phase\":\"%s\",\"cycle\":%d,\"rest_remaining_ms\":%u,\"attached\":%s,\"presets\":[%d,%d]},"
            "{\"id\":3,\"pin\":%d,\"name\":\"Servo 3\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
            "{\"id\":4,\"pin\":%d,\"name\":\"Servo 4\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s},"
            "{\"id\":5,\"pin\":%d,\"name\":\"Servo 5\",\"angle\":%d,\"pulse_us\":%d,\"status\":\"%s\",\"active\":false,\"running\":false,\"phase\":\"idle\",\"cycle\":0,\"rest_remaining_ms\":0,\"attached\":%s}"
@@ -1210,8 +1246,8 @@ void handleApiStatus() {
            staIp.c_str(),
            apIp.c_str(),
            MDNS_HOST,
-           SERVO_PINS[0], angles[0], pulses[0], statuses[0], running[0] ? "true" : "false", phases[0], cycles[0], restRemaining[0], attached[0] ? "true" : "false",
-           SERVO_PINS[1], angles[1], pulses[1], statuses[1], running[1] ? "true" : "false", phases[1], cycles[1], restRemaining[1], attached[1] ? "true" : "false",
+           SERVO_PINS[0], angles[0], pulses[0], statuses[0], running[0] ? "true" : "false", phases[0], cycles[0], restRemaining[0], attached[0] ? "true" : "false", DEFAULT_SERVO_PRESETS[0][0], DEFAULT_SERVO_PRESETS[0][1],
+           SERVO_PINS[1], angles[1], pulses[1], statuses[1], running[1] ? "true" : "false", phases[1], cycles[1], restRemaining[1], attached[1] ? "true" : "false", DEFAULT_SERVO_PRESETS[1][0], DEFAULT_SERVO_PRESETS[1][1],
            SERVO_PINS[2], angles[2], pulses[2], statuses[2], attached[2] ? "true" : "false",
            SERVO_PINS[3], angles[3], pulses[3], statuses[3], attached[3] ? "true" : "false",
            SERVO_PINS[4], angles[4], pulses[4], statuses[4], attached[4] ? "true" : "false",
