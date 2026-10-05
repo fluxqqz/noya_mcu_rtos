@@ -972,13 +972,8 @@ if (typeof window !== 'undefined') {
         if (res.ok) {
           applyStatusToState(state, res.data);
 
-          if (state.eyeMode) {
-            if (dom.fieldCycles) dom.fieldCycles.style.display = 'none';
-            if (dom.fieldActive) dom.fieldActive.style.display = '';
-          } else {
-            if (dom.fieldCycles) dom.fieldCycles.style.display = '';
-            if (dom.fieldActive) dom.fieldActive.style.display = 'none';
-          }
+          if (dom.fieldCycles) dom.fieldCycles.style.display = 'none';
+          if (dom.fieldActive) dom.fieldActive.style.display = '';
 
           const isAuto = state.mode === 'auto';
           dom.btnModeAuto.classList.toggle('active', isAuto);

@@ -23,7 +23,7 @@
 // ─── SLAVE IDENTITY (1 to 4) ─────────────────────────────────────────────────
 // Change SLAVE_INDEX when flashing each slave (1 = Plant 1, 2 = Plant 2, etc.)
 #ifndef SLAVE_INDEX
-#define SLAVE_INDEX 5
+#define SLAVE_INDEX 1
 #endif
 
 #if STANDALONE_EYES_MODE
@@ -47,7 +47,8 @@ typedef struct __attribute__((packed)) {
   uint8_t  servo_idx;    // 0 = Mouth 1 (GPIO 5), 1 = Mouth 2 (GPIO 1)
   uint8_t  open_angle;   // Open angle & resting position (0..180 deg)
   uint8_t  close_angle;  // Closed position (0..180 deg)
-  uint32_t duration_ms;  // Active animation duration in milliseconds
+  uint32_t duration_ms;  // Active animation duration in milliseconds (0 = STOP)
+  uint32_t rest_ms;      // Rest duration in milliseconds (relays OFF, rests OPEN)
 } AnimatronicCommand;
 
 // ─── SENSOR INTERACTION PARAMETERS (PLANT MODE) ──────────────────────────────
@@ -319,10 +320,16 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
       return;
     }
 
-    // START command from Master: configure angles and run autonomous sequence loop
+    // START command from Master: configure angles, durations, and run autonomous sequence loop
     if (open_deg != close_deg) {
       seq_configs[idx].open_deg = open_deg;
       seq_configs[idx].close_deg = close_deg;
+    }
+    if (cmd.duration_ms >= 1000) {
+      seq_configs[idx].active_duration_ms = (int)cmd.duration_ms;
+    }
+    if (cmd.rest_ms > 0) {
+      seq_configs[idx].rest_ms = (int)cmd.rest_ms;
     }
     anim_active[idx] = false;
     explicit_stopped[idx] = false;
@@ -333,8 +340,8 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
       startServoSeq(idx);
     }
 
-    Serial.printf("[ESP-NOW] Start Cmd #%u: Mouth %d, Open:%d Close:%d (Autonomous loop)\n",
-                  cmd.cmd_id, idx + 1, open_deg, close_deg);
+    Serial.printf("[ESP-NOW] Start Cmd #%u: Mouth %d, Open:%d Close:%d, Move:%ums, Rest:%ums (Autonomous loop)\n",
+                  cmd.cmd_id, idx + 1, open_deg, close_deg, cmd.duration_ms, cmd.rest_ms);
   }
 }
 
@@ -749,9 +756,7 @@ void servoWorkerTask(void* pvParameters) {
           currentCycle = 1;
           servo_cycle[idx] = 1;
           servo_rest_until[idx] = 0;
-#if STANDALONE_EYES_MODE
           sessionDeadlineMs = millis() + (uint32_t)activeDurationMs;
-#endif
         }
       }
     } else {
@@ -874,12 +879,8 @@ void servoWorkerTask(void* pvParameters) {
         continue;
       }
 
-      // Check session cycle completion
-#if STANDALONE_EYES_MODE
+      // Check session completion: finished if active duration time has elapsed
       bool sessionFinished = ((int32_t)(millis() - sessionDeadlineMs) >= 0);
-#else
-      bool sessionFinished = (currentCycle >= cyclesPerSession);
-#endif
 
       if (sessionFinished) {
         // Rest phase (consistently rests in openDeg across all modes)
@@ -922,9 +923,7 @@ void servoWorkerTask(void* pvParameters) {
           servo_rest_until[idx] = 0;
           currentCycle = 1;
           servo_cycle[idx] = 1;
-#if STANDALONE_EYES_MODE
           sessionDeadlineMs = millis() + (uint32_t)activeDurationMs;
-#endif
         }
         xSemaphoreGive(stateMutex);
       } else {
