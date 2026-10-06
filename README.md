@@ -67,7 +67,7 @@ All user-configurable parameters are located near the top of `noya_mcu_rtos.ino`
 | `DEFAULT_SERVO_PRESETS` | Line 98 | `{ { 50, 100 }, { 50, 100 } }` | Hard-coded default manual preset angles displayed on the dashboard buttons and inputs for Servo 1 and Servo 2. |
 | `DEFAULT_SEQ_OPEN_DEG` | Line 135 | `30` | Resting / open angle in degrees (`0` to `180`). Eyelids open or mouth open. |
 | `DEFAULT_SEQ_CLOSE_DEG` | Line 136 | `85` | Closed angle in degrees (`0` to `180`). Eyelids closed/blink or mouth closed. |
-| `START_DEG` | Line 91 | `50` | Initial parking angle commanded briefly during boot setup before relays cut power. |
+| `START_DEGS` | Line 97 | `{ 50, 60, 45, 55, 50 }` | Initial parking angles commanded for Servos 1 through 5 on boot setup before relays cut power. |
 
 ---
 

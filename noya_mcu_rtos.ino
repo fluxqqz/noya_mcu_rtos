@@ -69,8 +69,13 @@ const int AP_CHANNEL = 6;
 const int AP_MAX_CONN = 4;
 
 // Custom AP network settings
-IPAddress AP_LOCAL_IP(192, 168, 10, 1);
-IPAddress AP_GATEWAY(192, 168, 10, 1);
+#if STANDALONE_EYES_MODE
+IPAddress AP_LOCAL_IP(192, 168, 123, 10);
+IPAddress AP_GATEWAY(192, 168, 123, 10);
+#else
+IPAddress AP_LOCAL_IP(192, 168, 123, (uint8_t)SLAVE_INDEX);
+IPAddress AP_GATEWAY(192, 168, 123, (uint8_t)SLAVE_INDEX);
+#endif
 IPAddress AP_SUBNET(255, 255, 255, 0);
 
 // ─── OBJECTS ─────────────────────────────────────────────────────────────────
@@ -88,7 +93,8 @@ const int MIN_SERVO = 0;
 const int MAX_SERVO_US = 2500;
 const int MIN_SERVO_US = 500;
 
-const int START_DEG = 50;
+// Startup parking angles for each individual servo on boot (0..180 deg)
+const int START_DEGS[NUM_SERVOS] = { 50, 60, 45, 55, 50 };
 
 // Holding torque timeout for manual commands
 const uint32_t MANUAL_SERVO_HOLD_MS = 60000;
@@ -135,15 +141,15 @@ static bool isPaused = false;
 // ponytail: atomic single Preferences blob for non-volatile sequence config
 static const uint32_t SEQ_CONFIG_MAGIC = 0x4E534551; // 'NSEQ'
 static const uint16_t SEQ_CONFIG_VERSION = 3;
-static const int DEFAULT_SEQ_OPEN_DEG = 30;
-static const int DEFAULT_SEQ_CLOSE_DEG = 85;
+static const int DEFAULT_SEQ_OPEN_DEG = 50;
+static const int DEFAULT_SEQ_CLOSE_DEG = 100;
 static const int DEFAULT_SEQ_HOLD_MS = 200;
 static const int DEFAULT_SEQ_CYCLES = 5;
 #if STANDALONE_EYES_MODE
 static const int DEFAULT_SEQ_REST_MS = 60000; // 60s rest for standalone eye monster
 static const uint32_t DEFAULT_SEQ_ACTIVE_MS = 60000; // 60s active blinking
 #else
-static const int DEFAULT_SEQ_REST_MS = 10000;
+static const int DEFAULT_SEQ_REST_MS = 60000;
 static const uint32_t DEFAULT_SEQ_ACTIVE_MS = 60000;
 #endif
 
@@ -264,7 +270,7 @@ void loadSavedSequenceConfig() {
   }
 }
 
-static int commanded_angles[NUM_SERVOS] = { START_DEG, START_DEG, START_DEG, START_DEG, START_DEG };
+static int commanded_angles[NUM_SERVOS] = { START_DEGS[0], START_DEGS[1], START_DEGS[2], START_DEGS[3], START_DEGS[4] };
 static char servo_status_str[NUM_SERVOS][16] = { "IDLE", "IDLE", "PARKED", "PARKED", "PARKED" };
 static char servo_phase_str[NUM_SERVOS][16] = { "idle", "idle", "idle", "idle", "idle" };
 static bool servo_running[NUM_SERVOS] = { false, false, false, false, false };
@@ -1534,7 +1540,7 @@ void handleApiAttachment() {
 
     int restorePulse = last_actual_pulse_us[idx];
     if (restorePulse < MIN_SERVO_US || restorePulse > MAX_SERVO_US) {
-      restorePulse = map(START_DEG, MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
+      restorePulse = map(START_DEGS[idx], MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
       last_actual_pulse_us[idx] = restorePulse;
     }
     servos[idx].writeMicroseconds(restorePulse);
@@ -1890,7 +1896,7 @@ void setup() {
   pinMode(RELAY_2, OUTPUT);
   pinMode(SENSOR_PIN, INPUT);
 
-  // Power on servos to park them at START_DEG during boot
+  // Power on servos to park them at START_DEGS during boot
   digitalWrite(RELAY_1, HIGH);
   digitalWrite(RELAY_2, HIGH);
   relay_states[0] = true;
@@ -1907,12 +1913,12 @@ void setup() {
   for (int i = 0; i < NUM_SERVOS; i++) {
     servos[i].setPeriodHertz(50);
     servos[i].attach(SERVO_PINS[i], MIN_SERVO_US, MAX_SERVO_US);
-    servos[i].write(START_DEG);
-    last_actual_pulse_us[i] = map(START_DEG, MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
+    servos[i].write(START_DEGS[i]);
+    last_actual_pulse_us[i] = map(START_DEGS[i], MIN_SERVO, MAX_SERVO, MIN_SERVO_US, MAX_SERVO_US);
     servo_attached[i] = servos[i].attached();
   }
 
-  delay(1000); // mechanical settling delay into START_DEG
+  delay(1000); // mechanical settling delay into START_DEGS position
 
   // Power off relays so servos remain cool and quiet at rest
   digitalWrite(RELAY_1, LOW);
